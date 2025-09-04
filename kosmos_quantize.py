@@ -16,13 +16,26 @@ Choose the method based on your requirements:
 import os
 import torch
 import argparse
+import numpy as np
+from PIL import Image
 from transformers import (
     AutoTokenizer, 
     AutoProcessor,
-    Kosmos2_5ForConditionalGeneration,
     BitsAndBytesConfig,
     GPTQConfig
 )
+
+# Handle different model import possibilities
+try:
+    from transformers import Kosmos2_5ForConditionalGeneration
+except ImportError:
+    try:
+        from transformers import AutoModelForVision2Seq as Kosmos2_5ForConditionalGeneration
+        logger.warning("Using AutoModelForVision2Seq as fallback for Kosmos2_5ForConditionalGeneration")
+    except ImportError:
+        logger.error("Could not import Kosmos2_5ForConditionalGeneration or AutoModelForVision2Seq")
+        raise
+
 from optimum.gptq import GPTQQuantizer
 import logging
 
@@ -202,30 +215,58 @@ class KosmosQuantizer:
     
     def _prepare_calibration_data(self):
         """Prepare calibration data for quantization"""
-        # Simple calibration data - you should replace with domain-specific data
-        calibration_texts = [
+        # Create sample prompts for multimodal tasks
+        calibration_prompts = [
+            "<ocr>",
+            "<md>", 
             "What is in this image?",
             "Describe the contents of this document.",
             "Extract the text from this image.",
-            "What are the main elements visible in this picture?",
-            "Transcribe any text you can see in this image.",
         ]
         
-        if not self.tokenizer:
+        if not self.tokenizer or not self.processor:
             self.load_tokenizer_and_processor()
             
-        # Tokenize calibration data
+        # Prepare calibration data with dummy images
         calibration_data = []
-        for text in calibration_texts:
-            tokens = self.tokenizer(
-                text, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True, 
-                max_length=512
+        for prompt in calibration_prompts:
+            # Create a dummy image for each prompt
+            dummy_image = Image.fromarray(
+                np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
             )
-            calibration_data.append(tokens)
             
+            try:
+                # Use processor for multimodal inputs
+                inputs = self.processor(
+                    text=prompt,
+                    images=dummy_image,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                )
+                
+                # Remove problematic keys
+                filtered_inputs = {k: v for k, v in inputs.items() 
+                                 if k not in ['token_type_ids']}
+                
+                calibration_data.append(filtered_inputs)
+                
+            except Exception as e:
+                logger.warning(f"Failed to process calibration prompt '{prompt}': {e}")
+                # Fallback to text-only tokenization
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                )
+                # Remove problematic keys
+                filtered_inputs = {k: v for k, v in inputs.items() 
+                                 if k not in ['token_type_ids']}
+                calibration_data.append(filtered_inputs)
+                
         return calibration_data
     
     def _load_custom_dataset(self, dataset_path):
@@ -239,33 +280,107 @@ class KosmosQuantizer:
         """Benchmark model inference speed and memory usage"""
         logger.info("Benchmarking model performance...")
         
-        # Dummy input for benchmarking
-        dummy_input = "What do you see in this image?"
-        inputs = self.tokenizer(dummy_input, return_tensors="pt")
+        # For Kosmos-2.5, we need both text and image inputs
+        # Create a dummy image for benchmarking
+        from PIL import Image
+        import numpy as np
+        
+        # Create a small dummy image (RGB)
+        dummy_image = Image.fromarray(
+            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+        )
+        
+        # Prepare inputs using the processor
+        dummy_text = "<ocr>"  # or "<md>" for markdown
+        
+        if self.processor is None:
+            self.load_tokenizer_and_processor()
+        
+        # Use processor instead of tokenizer for multimodal inputs
+        inputs = self.processor(
+            text=dummy_text,
+            images=dummy_image,
+            return_tensors="pt"
+        )
+        
+        # Remove any unused parameters that might cause issues
+        # Keep only the essential inputs for generation
+        essential_inputs = {}
+        for key in ['input_ids', 'attention_mask', 'pixel_values', 'image_embeds']:
+            if key in inputs:
+                essential_inputs[key] = inputs[key]
+        
+        # Move inputs to the same device as model
+        device = next(model.parameters()).device
+        essential_inputs = {k: v.to(device) if v is not None else v 
+                           for k, v in essential_inputs.items()}
         
         # Warm up
+        logger.info("Warming up model...")
         with torch.no_grad():
-            for _ in range(3):
-                _ = model.generate(**inputs, max_length=50)
+            try:
+                for _ in range(3):
+                    _ = model.generate(
+                        **essential_inputs,
+                        max_new_tokens=50,  # Use max_new_tokens instead of max_length
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+            except Exception as e:
+                logger.warning(f"Warmup failed: {e}")
+                # Fallback to simpler generation
+                for _ in range(3):
+                    _ = model.generate(
+                        input_ids=essential_inputs.get('input_ids'),
+                        max_new_tokens=20,
+                        do_sample=False
+                    )
         
         # Benchmark
+        logger.info(f"Running benchmark with {test_iterations} iterations...")
         import time
         start_time = time.time()
         
+        successful_runs = 0
         with torch.no_grad():
             for i in range(test_iterations):
-                outputs = model.generate(**inputs, max_length=50)
-                if i == 0:
-                    logger.info(f"Sample output: {self.tokenizer.decode(outputs[0])}")
+                try:
+                    outputs = model.generate(
+                        **essential_inputs,
+                        max_new_tokens=50,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                    successful_runs += 1
                     
+                    if i == 0:
+                        # Decode and show sample output
+                        try:
+                            decoded_output = self.processor.batch_decode(
+                                outputs, skip_special_tokens=True
+                            )[0]
+                            logger.info(f"Sample output: {decoded_output}")
+                        except Exception as e:
+                            logger.info(f"Could not decode output: {e}")
+                        
+                except Exception as e:
+                    logger.warning(f"Generation failed on iteration {i}: {e}")
+                    continue
+                
         end_time = time.time()
-        avg_time = (end_time - start_time) / test_iterations
+        
+        if successful_runs == 0:
+            logger.error("All benchmark iterations failed!")
+            return None
+            
+        avg_time = (end_time - start_time) / successful_runs
         
         # Memory usage
         if torch.cuda.is_available():
             memory_used = torch.cuda.max_memory_allocated() / 1024**3  # GB
             logger.info(f"GPU Memory used: {memory_used:.2f} GB")
             
+        logger.info(f"Successful runs: {successful_runs}/{test_iterations}")
         logger.info(f"Average inference time: {avg_time:.3f} seconds")
         return avg_time
 
