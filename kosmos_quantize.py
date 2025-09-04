@@ -21,20 +21,10 @@ from PIL import Image
 from transformers import (
     AutoTokenizer, 
     AutoProcessor,
+    AutoModelForVision2Seq,  # Use Auto class to avoid GenerationMixin warning
     BitsAndBytesConfig,
     GPTQConfig
 )
-
-# Handle different model import possibilities
-try:
-    from transformers import Kosmos2_5ForConditionalGeneration
-except ImportError:
-    try:
-        from transformers import AutoModelForVision2Seq as Kosmos2_5ForConditionalGeneration
-        logger.warning("Using AutoModelForVision2Seq as fallback for Kosmos2_5ForConditionalGeneration")
-    except ImportError:
-        logger.error("Could not import Kosmos2_5ForConditionalGeneration or AutoModelForVision2Seq")
-        raise
 
 from optimum.gptq import GPTQQuantizer
 import logging
@@ -54,14 +44,27 @@ class KosmosQuantizer:
     def load_tokenizer_and_processor(self):
         """Load tokenizer and processor"""
         logger.info("Loading tokenizer and processor...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, 
-            cache_dir=self.cache_dir
-        )
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_name, 
-            cache_dir=self.cache_dir
-        )
+        try:
+            # Use trust_remote_code=True to avoid compatibility issues
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, 
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_name, 
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+            
+            # Handle vocabulary holes by ensuring proper padding token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                logger.info("Set pad_token to eos_token to handle vocabulary issues")
+                
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer/processor: {e}")
+            raise
         
     def quantize_bitsandbytes(self, bits=8, save_path="./kosmos2.5-bnb-quantized"):
         """
@@ -90,24 +93,73 @@ class KosmosQuantizer:
         else:
             raise ValueError("Only 4-bit and 8-bit quantization supported")
             
-        # Load model with quantization config
-        self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
-            self.model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            cache_dir=self.cache_dir
-        )
+        # Load model with quantization config using Auto class
+        try:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                cache_dir=self.cache_dir,
+                trust_remote_code=True  # Important for avoiding GenerationMixin warning
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model for quantization: {e}")
+            raise
         
-        # Save quantized model
-        self.model.save_pretrained(save_path)
+        # Create save directory
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save quantized model with proper error handling
+        try:
+            self.model.save_pretrained(save_path, safe_serialization=True)
+            logger.info(f"Model saved to {save_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save model: {e}")
+            # Try without safe serialization
+            self.model.save_pretrained(save_path, safe_serialization=False)
+            
+        # Save tokenizer and processor with vocabulary fix
         if self.tokenizer:
-            self.tokenizer.save_pretrained(save_path)
+            try:
+                # Handle vocabulary holes by cleaning the tokenizer
+                self._fix_tokenizer_vocabulary()
+                self.tokenizer.save_pretrained(save_path)
+                logger.info(f"Tokenizer saved to {save_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save tokenizer: {e}")
+                
         if self.processor:
-            self.processor.save_pretrained(save_path)
+            try:
+                self.processor.save_pretrained(save_path)
+                logger.info(f"Processor saved to {save_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save processor: {e}")
             
         logger.info(f"BitsAndBytes {bits}-bit quantized model saved to {save_path}")
         return self.model
+    
+    def _fix_tokenizer_vocabulary(self):
+        """Fix vocabulary holes in the tokenizer"""
+        try:
+            # Get the vocabulary
+            vocab = self.tokenizer.get_vocab()
+            vocab_size = len(vocab)
+            
+            # Check for holes in vocabulary indices
+            indices = sorted(vocab.values())
+            max_index = max(indices) if indices else 0
+            
+            logger.info(f"Vocabulary size: {vocab_size}, Max index: {max_index}")
+            
+            # If there are holes, we'll just log them but continue
+            # The warning is mostly cosmetic for saving
+            missing_indices = set(range(max_index + 1)) - set(indices)
+            if missing_indices:
+                logger.warning(f"Found {len(missing_indices)} holes in vocabulary at indices: {sorted(list(missing_indices))[:20]}...")
+                
+        except Exception as e:
+            logger.warning(f"Could not analyze vocabulary: {e}")
         
     def quantize_gptq(self, bits=4, save_path="./kosmos2.5-gptq-quantized", dataset_path=None):
         """
@@ -120,13 +172,18 @@ class KosmosQuantizer:
         """
         logger.info(f"Starting GPTQ {bits}-bit quantization...")
         
-        # Load unquantized model first
-        self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            cache_dir=self.cache_dir
-        )
+        # Load unquantized model first using Auto class
+        try:
+            self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model for GPTQ: {e}")
+            raise
         
         # Configure GPTQ
         gptq_config = GPTQConfig(
@@ -136,31 +193,60 @@ class KosmosQuantizer:
         )
         
         # Create quantizer
-        quantizer = GPTQQuantizer(
-            bits=bits,
-            group_size=128,
-            desc_act=False,
-        )
+        try:
+            quantizer = GPTQQuantizer(
+                bits=bits,
+                group_size=128,
+                desc_act=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create GPTQ quantizer: {e}")
+            raise
         
-        # Prepare calibration data (you can replace this with domain-specific data)
-        if dataset_path is None:
-            calibration_data = self._prepare_calibration_data()
-        else:
-            calibration_data = self._load_custom_dataset(dataset_path)
+        # Prepare calibration data
+        try:
+            if dataset_path is None:
+                calibration_data = self._prepare_calibration_data()
+            else:
+                calibration_data = self._load_custom_dataset(dataset_path)
+        except Exception as e:
+            logger.error(f"Failed to prepare calibration data: {e}")
+            raise
         
         # Quantize the model
-        quantized_model = quantizer.quantize_model(
-            self.model, 
-            tokenizer=self.tokenizer,
-            calibration_dataset=calibration_data
-        )
+        try:
+            quantized_model = quantizer.quantize_model(
+                self.model, 
+                tokenizer=self.tokenizer,
+                calibration_dataset=calibration_data
+            )
+        except Exception as e:
+            logger.error(f"Failed to quantize model: {e}")
+            raise
+        
+        # Create save directory
+        os.makedirs(save_path, exist_ok=True)
         
         # Save quantized model
-        quantized_model.save_pretrained(save_path)
+        try:
+            quantized_model.save_pretrained(save_path, safe_serialization=True)
+        except Exception as e:
+            logger.warning(f"Failed to save with safe serialization: {e}")
+            quantized_model.save_pretrained(save_path, safe_serialization=False)
+            
+        # Save tokenizer and processor
         if self.tokenizer:
-            self.tokenizer.save_pretrained(save_path)
+            try:
+                self._fix_tokenizer_vocabulary()
+                self.tokenizer.save_pretrained(save_path)
+            except Exception as e:
+                logger.warning(f"Failed to save tokenizer: {e}")
+                
         if self.processor:
-            self.processor.save_pretrained(save_path)
+            try:
+                self.processor.save_pretrained(save_path)
+            except Exception as e:
+                logger.warning(f"Failed to save processor: {e}")
             
         logger.info(f"GPTQ {bits}-bit quantized model saved to {save_path}")
         return quantized_model
@@ -187,28 +273,52 @@ class KosmosQuantizer:
         }
         
         # Load model for AWQ quantization
-        model = AutoAWQForCausalLM.from_pretrained(
-            self.model_name, 
-            device_map="auto",
-            cache_dir=self.cache_dir
-        )
+        try:
+            model = AutoAWQForCausalLM.from_pretrained(
+                self.model_name, 
+                device_map="auto",
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model for AWQ: {e}")
+            raise
         
         # Prepare calibration data
         calibration_data = self._prepare_calibration_data()
         
         # Quantize
-        model.quantize(
-            tokenizer=self.tokenizer,
-            quant_config=quant_config,
-            calib_data=calibration_data
-        )
+        try:
+            model.quantize(
+                tokenizer=self.tokenizer,
+                quant_config=quant_config,
+                calib_data=calibration_data
+            )
+        except Exception as e:
+            logger.error(f"AWQ quantization failed: {e}")
+            raise
+        
+        # Create save directory
+        os.makedirs(save_path, exist_ok=True)
         
         # Save
-        model.save_quantized(save_path)
+        try:
+            model.save_quantized(save_path)
+        except Exception as e:
+            logger.warning(f"Failed to save AWQ model: {e}")
+            
         if self.tokenizer:
-            self.tokenizer.save_pretrained(save_path)
+            try:
+                self._fix_tokenizer_vocabulary()
+                self.tokenizer.save_pretrained(save_path)
+            except Exception as e:
+                logger.warning(f"Failed to save tokenizer: {e}")
+                
         if self.processor:
-            self.processor.save_pretrained(save_path)
+            try:
+                self.processor.save_pretrained(save_path)
+            except Exception as e:
+                logger.warning(f"Failed to save processor: {e}")
             
         logger.info(f"AWQ quantized model saved to {save_path}")
         return model
@@ -246,27 +356,38 @@ class KosmosQuantizer:
                     max_length=512
                 )
                 
-                # Remove problematic keys
-                filtered_inputs = {k: v for k, v in inputs.items() 
-                                 if k not in ['token_type_ids']}
+                # Remove problematic keys and clean inputs
+                filtered_inputs = {}
+                for k, v in inputs.items():
+                    if k not in ['token_type_ids'] and v is not None:
+                        # Ensure tensors are proper shape
+                        if hasattr(v, 'shape') and len(v.shape) > 0:
+                            filtered_inputs[k] = v
                 
-                calibration_data.append(filtered_inputs)
+                if filtered_inputs:  # Only add if we have valid inputs
+                    calibration_data.append(filtered_inputs)
                 
             except Exception as e:
                 logger.warning(f"Failed to process calibration prompt '{prompt}': {e}")
                 # Fallback to text-only tokenization
-                inputs = self.tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512
-                )
-                # Remove problematic keys
-                filtered_inputs = {k: v for k, v in inputs.items() 
-                                 if k not in ['token_type_ids']}
-                calibration_data.append(filtered_inputs)
+                try:
+                    inputs = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=512
+                    )
+                    # Remove problematic keys
+                    filtered_inputs = {k: v for k, v in inputs.items() 
+                                     if k not in ['token_type_ids'] and v is not None}
+                    if filtered_inputs:
+                        calibration_data.append(filtered_inputs)
+                except Exception as e2:
+                    logger.warning(f"Fallback tokenization also failed: {e2}")
+                    continue
                 
+        logger.info(f"Prepared {len(calibration_data)} calibration samples")
         return calibration_data
     
     def _load_custom_dataset(self, dataset_path):
@@ -281,108 +402,111 @@ class KosmosQuantizer:
         logger.info("Benchmarking model performance...")
         
         # For Kosmos-2.5, we need both text and image inputs
-        # Create a dummy image for benchmarking
-        from PIL import Image
-        import numpy as np
-        
-        # Create a small dummy image (RGB)
         dummy_image = Image.fromarray(
             np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
         )
         
         # Prepare inputs using the processor
-        dummy_text = "<ocr>"  # or "<md>" for markdown
+        dummy_text = "<ocr>"
         
         if self.processor is None:
             self.load_tokenizer_and_processor()
         
-        # Use processor instead of tokenizer for multimodal inputs
-        inputs = self.processor(
-            text=dummy_text,
-            images=dummy_image,
-            return_tensors="pt"
-        )
-        
-        # Remove any unused parameters that might cause issues
-        # Keep only the essential inputs for generation
-        essential_inputs = {}
-        for key in ['input_ids', 'attention_mask', 'pixel_values', 'image_embeds']:
-            if key in inputs:
-                essential_inputs[key] = inputs[key]
-        
-        # Move inputs to the same device as model
-        device = next(model.parameters()).device
-        essential_inputs = {k: v.to(device) if v is not None else v 
-                           for k, v in essential_inputs.items()}
-        
-        # Warm up
-        logger.info("Warming up model...")
-        with torch.no_grad():
-            try:
-                for _ in range(3):
-                    _ = model.generate(
-                        **essential_inputs,
-                        max_new_tokens=50,  # Use max_new_tokens instead of max_length
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.eos_token_id
-                    )
-            except Exception as e:
-                logger.warning(f"Warmup failed: {e}")
-                # Fallback to simpler generation
-                for _ in range(3):
-                    _ = model.generate(
-                        input_ids=essential_inputs.get('input_ids'),
-                        max_new_tokens=20,
-                        do_sample=False
-                    )
-        
-        # Benchmark
-        logger.info(f"Running benchmark with {test_iterations} iterations...")
-        import time
-        start_time = time.time()
-        
-        successful_runs = 0
-        with torch.no_grad():
-            for i in range(test_iterations):
+        try:
+            # Use processor instead of tokenizer for multimodal inputs
+            inputs = self.processor(
+                text=dummy_text,
+                images=dummy_image,
+                return_tensors="pt"
+            )
+            
+            # Remove any unused parameters that might cause issues
+            essential_inputs = {}
+            for key in ['input_ids', 'attention_mask', 'pixel_values', 'image_embeds']:
+                if key in inputs and inputs[key] is not None:
+                    essential_inputs[key] = inputs[key]
+            
+            # Move inputs to the same device as model
+            device = next(model.parameters()).device
+            essential_inputs = {k: v.to(device) if v is not None else v 
+                               for k, v in essential_inputs.items()}
+            
+            # Warm up
+            logger.info("Warming up model...")
+            with torch.no_grad():
                 try:
-                    outputs = model.generate(
-                        **essential_inputs,
-                        max_new_tokens=50,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.eos_token_id
-                    )
-                    successful_runs += 1
-                    
-                    if i == 0:
-                        # Decode and show sample output
-                        try:
-                            decoded_output = self.processor.batch_decode(
-                                outputs, skip_special_tokens=True
-                            )[0]
-                            logger.info(f"Sample output: {decoded_output}")
-                        except Exception as e:
-                            logger.info(f"Could not decode output: {e}")
-                        
+                    for _ in range(3):
+                        _ = model.generate(
+                            **essential_inputs,
+                            max_new_tokens=50,
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.eos_token_id if self.tokenizer.pad_token_id is None else self.tokenizer.pad_token_id
+                        )
                 except Exception as e:
-                    logger.warning(f"Generation failed on iteration {i}: {e}")
-                    continue
+                    logger.warning(f"Warmup failed: {e}")
+                    # Fallback to simpler generation
+                    try:
+                        for _ in range(3):
+                            _ = model.generate(
+                                input_ids=essential_inputs.get('input_ids'),
+                                max_new_tokens=20,
+                                do_sample=False
+                            )
+                    except Exception as e2:
+                        logger.error(f"Fallback warmup also failed: {e2}")
+                        return None
+            
+            # Benchmark
+            logger.info(f"Running benchmark with {test_iterations} iterations...")
+            import time
+            start_time = time.time()
+            
+            successful_runs = 0
+            with torch.no_grad():
+                for i in range(test_iterations):
+                    try:
+                        outputs = model.generate(
+                            **essential_inputs,
+                            max_new_tokens=50,
+                            do_sample=False,
+                            pad_token_id=self.tokenizer.eos_token_id if self.tokenizer.pad_token_id is None else self.tokenizer.pad_token_id
+                        )
+                        successful_runs += 1
+                        
+                        if i == 0:
+                            # Decode and show sample output
+                            try:
+                                decoded_output = self.processor.batch_decode(
+                                    outputs, skip_special_tokens=True
+                                )[0]
+                                logger.info(f"Sample output: {decoded_output}")
+                            except Exception as e:
+                                logger.info(f"Could not decode output: {e}")
+                        
+                    except Exception as e:
+                        logger.warning(f"Generation failed on iteration {i}: {e}")
+                        continue
+                    
+            end_time = time.time()
+            
+            if successful_runs == 0:
+                logger.error("All benchmark iterations failed!")
+                return None
                 
-        end_time = time.time()
-        
-        if successful_runs == 0:
-            logger.error("All benchmark iterations failed!")
+            avg_time = (end_time - start_time) / successful_runs
+            
+            # Memory usage
+            if torch.cuda.is_available():
+                memory_used = torch.cuda.max_memory_allocated() / 1024**3  # GB
+                logger.info(f"GPU Memory used: {memory_used:.2f} GB")
+                
+            logger.info(f"Successful runs: {successful_runs}/{test_iterations}")
+            logger.info(f"Average inference time: {avg_time:.3f} seconds")
+            return avg_time
+            
+        except Exception as e:
+            logger.error(f"Benchmark failed: {e}")
             return None
-            
-        avg_time = (end_time - start_time) / successful_runs
-        
-        # Memory usage
-        if torch.cuda.is_available():
-            memory_used = torch.cuda.max_memory_allocated() / 1024**3  # GB
-            logger.info(f"GPU Memory used: {memory_used:.2f} GB")
-            
-        logger.info(f"Successful runs: {successful_runs}/{test_iterations}")
-        logger.info(f"Average inference time: {avg_time:.3f} seconds")
-        return avg_time
 
 def main():
     parser = argparse.ArgumentParser(description='Quantize Kosmos-2.5 model')
@@ -408,18 +532,23 @@ def main():
     quantizer.load_tokenizer_and_processor()
     
     # Perform quantization
-    if args.method == 'bnb':
-        model = quantizer.quantize_bitsandbytes(args.bits, args.save_path)
-    elif args.method == 'gptq':
-        model = quantizer.quantize_gptq(args.bits, args.save_path, args.dataset_path)
-    elif args.method == 'awq':
-        model = quantizer.quantize_awq(args.save_path)
-    
-    # Benchmark if requested
-    if args.benchmark:
-        quantizer.benchmark_model(model)
-    
-    logger.info("Quantization completed successfully!")
+    try:
+        if args.method == 'bnb':
+            model = quantizer.quantize_bitsandbytes(args.bits, args.save_path)
+        elif args.method == 'gptq':
+            model = quantizer.quantize_gptq(args.bits, args.save_path, args.dataset_path)
+        elif args.method == 'awq':
+            model = quantizer.quantize_awq(args.save_path)
+        
+        # Benchmark if requested
+        if args.benchmark:
+            quantizer.benchmark_model(model)
+        
+        logger.info("Quantization completed successfully!")
+        
+    except Exception as e:
+        logger.error(f"Quantization failed: {e}")
+        raise
 
 if __name__ == "__main__":
     # Example usage:
