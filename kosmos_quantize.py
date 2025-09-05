@@ -21,7 +21,7 @@ from PIL import Image
 from transformers import (
     AutoTokenizer, 
     AutoProcessor,
-    AutoModelForVision2Seq,  # Use Auto class to avoid GenerationMixin warning
+    AutoModelForImageTextToText,  # Use the new class name
     BitsAndBytesConfig,
     GPTQConfig
 )
@@ -33,6 +33,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Update the class to handle both old and new model classes
 class KosmosQuantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
         self.model_name = model_name
@@ -41,6 +42,18 @@ class KosmosQuantizer:
         self.processor = None
         self.model = None
         
+        # Try to determine the correct model class
+        try:
+            # Try the new class first
+            from transformers import AutoModelForImageTextToText
+            self.model_class = AutoModelForImageTextToText
+            logger.info("Using AutoModelForImageTextToText")
+        except ImportError:
+            # Fallback to the deprecated class
+            from transformers import AutoModelForVision2Seq
+            self.model_class = AutoModelForVision2Seq
+            logger.info("Using AutoModelForVision2Seq (deprecated)")
+            
     def load_tokenizer_and_processor(self):
         """Load tokenizer and processor"""
         logger.info("Loading tokenizer and processor...")
@@ -51,10 +64,13 @@ class KosmosQuantizer:
                 cache_dir=self.cache_dir,
                 trust_remote_code=True
             )
+            
+            # Handle the slow processor warning
             self.processor = AutoProcessor.from_pretrained(
                 self.model_name, 
                 cache_dir=self.cache_dir,
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_fast=True  # Enable fast processor to avoid warning
             )
             
             # Handle vocabulary holes by ensuring proper padding token
@@ -64,15 +80,21 @@ class KosmosQuantizer:
                 
         except Exception as e:
             logger.error(f"Failed to load tokenizer/processor: {e}")
-            raise
+            # Fallback without use_fast
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_name, 
+                    cache_dir=self.cache_dir,
+                    trust_remote_code=True
+                )
+                logger.info("Loaded processor without use_fast option")
+            except Exception as e2:
+                logger.error(f"Fallback processor loading also failed: {e2}")
+                raise
         
     def quantize_bitsandbytes(self, bits=8, save_path="./kosmos2.5-bnb-quantized"):
         """
         Quantize using BitsAndBytes (8-bit or 4-bit)
-        
-        Args:
-            bits (int): 4 or 8 bit quantization
-            save_path (str): Path to save quantized model
         """
         logger.info(f"Starting BitsAndBytes {bits}-bit quantization...")
         
@@ -93,15 +115,15 @@ class KosmosQuantizer:
         else:
             raise ValueError("Only 4-bit and 8-bit quantization supported")
             
-        # Load model with quantization config using Auto class
+        # Load model with quantization config using the correct model class
         try:
-            self.model = AutoModelForVision2Seq.from_pretrained(
+            self.model = self.model_class.from_pretrained(
                 self.model_name,
                 quantization_config=bnb_config,
                 device_map="auto",
-                torch_dtype=torch.float16,
+                dtype=torch.float16,  # Use dtype instead of torch_dtype
                 cache_dir=self.cache_dir,
-                trust_remote_code=True  # Important for avoiding GenerationMixin warning
+                trust_remote_code=True
             )
         except Exception as e:
             logger.error(f"Failed to load model for quantization: {e}")
@@ -174,7 +196,7 @@ class KosmosQuantizer:
         
         # Load unquantized model first using Auto class
         try:
-            self.model = AutoModelForVision2Seq.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
@@ -185,14 +207,17 @@ class KosmosQuantizer:
             logger.error(f"Failed to load model for GPTQ: {e}")
             raise
         
-        # Configure GPTQ
-        gptq_config = GPTQConfig(
-            bits=bits,
-            group_size=128,
-            desc_act=False,  # Disable activation ordering for stability
-        )
+        # Prepare calibration data first
+        try:
+            if dataset_path is None:
+                calibration_data = self._prepare_calibration_data()
+            else:
+                calibration_data = self._load_custom_dataset(dataset_path)
+        except Exception as e:
+            logger.error(f"Failed to prepare calibration data: {e}")
+            raise
         
-        # Create quantizer
+        # Create quantizer with the correct parameters
         try:
             quantizer = GPTQQuantizer(
                 bits=bits,
@@ -203,51 +228,75 @@ class KosmosQuantizer:
             logger.error(f"Failed to create GPTQ quantizer: {e}")
             raise
         
-        # Prepare calibration data
+        # Quantize the model using the correct method signature
         try:
-            if dataset_path is None:
-                calibration_data = self._prepare_calibration_data()
-            else:
-                calibration_data = self._load_custom_dataset(dataset_path)
-        except Exception as e:
-            logger.error(f"Failed to prepare calibration data: {e}")
-            raise
-        
-        # Quantize the model
-        try:
+            # The correct way to call quantize_model for optimum's GPTQQuantizer
             quantized_model = quantizer.quantize_model(
-                self.model, 
-                tokenizer=self.tokenizer,
-                calibration_dataset=calibration_data
+                model=self.model, 
+                tokenizer=self.tokenizer
             )
         except Exception as e:
             logger.error(f"Failed to quantize model: {e}")
-            raise
-        
+            # Try alternative approach using optimum's GPTQ workflow
+            try:
+                logger.info("Trying alternative GPTQ approach...")
+                
+                # Use the GPTQ config approach
+                from transformers import GPTQConfig
+                
+                gptq_config = GPTQConfig(
+                    bits=bits,
+                    group_size=128,
+                    desc_act=False,
+                    tokenizer=self.tokenizer,
+                    calibration_dataset=calibration_data
+                )
+                
+                # Load model with GPTQ config
+                quantized_model = AutoModelForImageTextToText.from_pretrained(
+                    self.model_name,
+                    quantization_config=gptq_config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    cache_dir=self.cache_dir,
+                    trust_remote_code=True
+                )
+            except Exception as e2:
+                logger.error(f"Alternative GPTQ approach also failed: {e2}")
+                raise e2
+    
         # Create save directory
         os.makedirs(save_path, exist_ok=True)
         
         # Save quantized model
         try:
             quantized_model.save_pretrained(save_path, safe_serialization=True)
+            logger.info(f"Quantized model saved to {save_path}")
         except Exception as e:
             logger.warning(f"Failed to save with safe serialization: {e}")
-            quantized_model.save_pretrained(save_path, safe_serialization=False)
-            
+            try:
+                quantized_model.save_pretrained(save_path, safe_serialization=False)
+                logger.info(f"Quantized model saved to {save_path} (without safe serialization)")
+            except Exception as e2:
+                logger.error(f"Failed to save model completely: {e2}")
+                raise e2
+        
         # Save tokenizer and processor
         if self.tokenizer:
             try:
                 self._fix_tokenizer_vocabulary()
                 self.tokenizer.save_pretrained(save_path)
+                logger.info(f"Tokenizer saved to {save_path}")
             except Exception as e:
                 logger.warning(f"Failed to save tokenizer: {e}")
-                
+            
         if self.processor:
             try:
                 self.processor.save_pretrained(save_path)
+                logger.info(f"Processor saved to {save_path}")
             except Exception as e:
                 logger.warning(f"Failed to save processor: {e}")
-            
+        
         logger.info(f"GPTQ {bits}-bit quantized model saved to {save_path}")
         return quantized_model
     
