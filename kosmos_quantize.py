@@ -367,72 +367,115 @@ class KosmosQuantizer:
         Quantize using AWQ (Activation-aware Weight Quantization)
         Note: This requires the awq library to be installed
         """
+        logger.warning("AWQ quantization is not compatible with Kosmos-2.5 multimodal architecture.")
+        logger.info("AWQ is designed for causal language models, not multimodal vision-language models.")
+        
         try:
             from awq import AutoAWQForCausalLM
             from awq.quantize.quantizer import AwqQuantizer
         except ImportError:
             raise ImportError("AWQ library not installed. Install with: pip install autoawq")
-            
-        logger.info("Starting AWQ 4-bit quantization...")
         
-        # AWQ quantization config
-        quant_config = {
-            "zero_point": True,
-            "q_group_size": 128,
-            "w_bit": 4,
-            "version": "GEMM"
-        }
+        logger.info("Attempting AWQ 4-bit quantization (experimental)...")
         
-        # Load model for AWQ quantization
+        # Check if the model architecture is supported
         try:
+            # Try to load the model to check compatibility
+            temp_model = self.model_class.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+            
+            model_type = getattr(temp_model.config, 'model_type', 'unknown')
+            logger.info(f"Detected model type: {model_type}")
+            
+            # Clean up temp model
+            del temp_model
+            torch.cuda.empty_cache()
+            
+            if model_type == 'kosmos-2.5':
+                logger.error("AWQ does not support Kosmos-2.5 model architecture.")
+                logger.info("Kosmos-2.5 uses a multimodal architecture that AWQ cannot quantize.")
+                logger.info("\nRecommended alternatives:")
+                logger.info("1. Use BitsAndBytes 4-bit quantization (best compatibility):")
+                logger.info("   python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
+                logger.info("2. Use BitsAndBytes 8-bit quantization (faster):")
+                logger.info("   python kosmos_quantize.py --method bnb --bits 8 --save_path ./kosmos2.5-bnb8bit")
+                raise TypeError(f"AWQ does not support {model_type} model architecture. Please use BitsAndBytes instead.")
+                
+        except Exception as e:
+            if "isn't supported yet" in str(e) or "kosmos-2.5" in str(e).lower():
+                logger.error("AWQ quantization failed: Model architecture not supported")
+                logger.info("AWQ currently supports these model types:")
+                logger.info("  - LLaMA, LLaMA-2, Code Llama")
+                logger.info("  - OPT, Falcon, Bloom")
+                logger.info("  - GPT-J, GPT-NeoX")
+                logger.info("  - Mistral, Mixtral")
+                logger.info("  - Qwen, Baichuan, etc.")
+                logger.info("")
+                logger.info("Kosmos-2.5 is a multimodal model that AWQ cannot quantize.")
+                logger.info("\nPlease use BitsAndBytes quantization instead:")
+                logger.info("  python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
+                raise TypeError("AWQ quantization is not supported for Kosmos-2.5. Use BitsAndBytes instead.")
+            else:
+                raise e
+        
+        # This code will not be reached for Kosmos-2.5, but kept for other models
+        try:
+            # AWQ quantization config
+            quant_config = {
+                "zero_point": True,
+                "q_group_size": 128,
+                "w_bit": 4,
+                "version": "GEMM"
+            }
+            
+            # Load model for AWQ quantization
             model = AutoAWQForCausalLM.from_pretrained(
                 self.model_name, 
                 device_map="auto",
                 cache_dir=self.cache_dir,
                 trust_remote_code=True
             )
-        except Exception as e:
-            logger.error(f"Failed to load model for AWQ: {e}")
-            raise
-        
-        # Prepare calibration data
-        calibration_data = self._prepare_calibration_data()
-        
-        # Quantize
-        try:
+            
+            # Prepare calibration data
+            calibration_data = self._prepare_calibration_data()
+            
+            # Quantize
             model.quantize(
                 tokenizer=self.tokenizer,
                 quant_config=quant_config,
                 calib_data=calibration_data
             )
+            
+            # Create save directory
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Save
+            model.save_quantized(save_path)
+            
+            if self.tokenizer:
+                try:
+                    self._fix_tokenizer_vocabulary()
+                    self.tokenizer.save_pretrained(save_path)
+                except Exception as e:
+                    logger.warning(f"Failed to save tokenizer: {e}")
+                    
+            if self.processor:
+                try:
+                    self.processor.save_pretrained(save_path)
+                except Exception as e:
+                    logger.warning(f"Failed to save processor: {e}")
+            
+            logger.info(f"AWQ quantized model saved to {save_path}")
+            return model
+            
         except Exception as e:
             logger.error(f"AWQ quantization failed: {e}")
             raise
-        
-        # Create save directory
-        os.makedirs(save_path, exist_ok=True)
-        
-        # Save
-        try:
-            model.save_quantized(save_path)
-        except Exception as e:
-            logger.warning(f"Failed to save AWQ model: {e}")
-            
-        if self.tokenizer:
-            try:
-                self._fix_tokenizer_vocabulary()
-                self.tokenizer.save_pretrained(save_path)
-            except Exception as e:
-                logger.warning(f"Failed to save tokenizer: {e}")
-                
-        if self.processor:
-            try:
-                self.processor.save_pretrained(save_path)
-            except Exception as e:
-                logger.warning(f"Failed to save processor: {e}")
-            
-        logger.info(f"AWQ quantized model saved to {save_path}")
-        return model
     
     def _prepare_calibration_data(self):
         """Prepare calibration data for quantization"""
@@ -625,41 +668,62 @@ class KosmosQuantizer:
         
         compatibility = {
             'bitsandbytes': True,  # Almost always works
-            'gptq': False,
-            'awq': False
+            'gptq': False,         # Usually incompatible with multimodal models
+            'awq': False           # Only works with specific causal LM architectures
         }
         
-        if self.model is None:
-            try:
-                # Load model briefly to check config
-                temp_model = self.model_class.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=True
-                )
-                
-                # Check for GPTQ compatibility
-                if hasattr(temp_model.config, 'use_cache') or hasattr(temp_model, 'generate'):
-                    compatibility['gptq'] = True
-                
-                # Check for AWQ compatibility (usually works with causal LM models)
-                if hasattr(temp_model, 'generate'):
-                    compatibility['awq'] = True
-                    
-                # Clean up
-                del temp_model
-                torch.cuda.empty_cache()
-                
-            except Exception as e:
-                logger.warning(f"Could not check compatibility: {e}")
-    
-        logger.info("Quantization compatibility:")
+        try:
+            # Load model briefly to check config
+            temp_model = self.model_class.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+            
+            model_type = getattr(temp_model.config, 'model_type', 'unknown')
+            logger.info(f"Model type: {model_type}")
+            
+            # Check for GPTQ compatibility (limited for multimodal models)
+            if hasattr(temp_model.config, 'use_cache') and model_type != 'kosmos-2.5':
+                compatibility['gptq'] = True
+            
+            # AWQ compatibility - very limited model support
+            awq_supported_models = [
+                'llama', 'llama2', 'code_llama', 'opt', 'falcon', 'bloom',
+                'gptj', 'gpt_neox', 'mistral', 'mixtral', 'qwen', 'baichuan'
+            ]
+            
+            if any(supported in model_type.lower() for supported in awq_supported_models):
+                compatibility['awq'] = True
+            
+            # Clean up
+            del temp_model
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.warning(f"Could not check compatibility: {e}")
+
+        logger.info("Quantization compatibility for this model:")
         for method, compatible in compatibility.items():
-            status = "✓ Compatible" if compatible else "✗ May not work"
+            if compatible:
+                status = "✓ Compatible"
+                color = ""
+            else:
+                status = "✗ Not supported"
+                color = ""
             logger.info(f"  {method.upper()}: {status}")
     
+        # Provide specific recommendations
+        logger.info("\nRecommendations:")
+        if compatibility['bitsandbytes']:
+            logger.info("✓ BitsAndBytes: Recommended for Kosmos-2.5 (reliable, good compression)")
+        if not compatibility['gptq']:
+            logger.info("✗ GPTQ: Not compatible with multimodal architectures")
+        if not compatibility['awq']:
+            logger.info("✗ AWQ: Only supports specific causal language models")
+
         return compatibility
 
 def main():
@@ -683,6 +747,23 @@ def main():
     
     args = parser.parse_args()
     
+    # Special handling for Kosmos-2.5
+    if 'kosmos' in args.model_name.lower():
+        if args.method in ['gptq', 'awq']:
+            logger.warning(f"⚠️  {args.method.upper()} is not compatible with Kosmos-2.5!")
+            logger.info("Kosmos-2.5 is a multimodal vision-language model.")
+            logger.info("GPTQ and AWQ are designed for causal language models only.")
+            logger.info("")
+            logger.info("✅ Recommended: Use BitsAndBytes quantization")
+            logger.info("   python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
+            logger.info("")
+            
+            if not args.check_compatibility:
+                user_input = input("Continue anyway? This will likely fail. (y/N): ")
+                if user_input.lower() != 'y':
+                    logger.info("Exiting. Please use --method bnb instead.")
+                    return
+    
     # Initialize quantizer
     quantizer = KosmosQuantizer(args.model_name, args.cache_dir)
     quantizer.load_tokenizer_and_processor()
@@ -691,12 +772,9 @@ def main():
     if args.check_compatibility:
         compatibility = quantizer.check_quantization_compatibility()
         if not compatibility.get(args.method, False):
-            logger.warning(f"{args.method.upper()} may not be compatible with this model.")
-            logger.info("Consider using BitsAndBytes (bnb) which has the best compatibility.")
-            user_input = input("Do you want to continue anyway? (y/N): ")
-            if user_input.lower() != 'y':
-                logger.info("Exiting...")
-                return
+            logger.warning(f"{args.method.upper()} is not compatible with this model.")
+            logger.info("Please choose a compatible quantization method.")
+            return
     
     # Perform quantization
     try:
@@ -711,15 +789,24 @@ def main():
         if args.benchmark:
             quantizer.benchmark_model(model)
         
-        logger.info("Quantization completed successfully!")
+        logger.info("✅ Quantization completed successfully!")
+        logger.info(f"📁 Quantized model saved to: {args.save_path}")
         
     except Exception as e:
-        logger.error(f"Quantization failed: {e}")
-        logger.info("\nTroubleshooting suggestions:")
-        logger.info("1. Try BitsAndBytes quantization instead:")
-        logger.info("   python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
-        logger.info("2. Ensure you have sufficient GPU memory")
-        logger.info("3. Try running with --check_compatibility first")
+        logger.error(f"❌ Quantization failed: {e}")
+        logger.info("\n🔧 Troubleshooting suggestions:")
+        
+        if 'kosmos' in args.model_name.lower():
+            logger.info("For Kosmos-2.5, use BitsAndBytes quantization:")
+            logger.info("  python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
+            logger.info("  python kosmos_quantize.py --method bnb --bits 8 --save_path ./kosmos2.5-bnb8bit")
+        else:
+            logger.info("1. Try BitsAndBytes quantization (most compatible):")
+            logger.info("   python kosmos_quantize.py --method bnb --bits 4 --save_path ./model-bnb4bit")
+            logger.info("2. Check model compatibility:")
+            logger.info("   python kosmos_quantize.py --check_compatibility --method bnb --save_path ./temp")
+            logger.info("3. Ensure sufficient GPU memory is available")
+        
         raise
 
 if __name__ == "__main__":
