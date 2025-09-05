@@ -206,12 +206,12 @@ class KosmosQuantizer:
         except Exception as e:
             logger.error(f"Failed to load model for GPTQ: {e}")
             raise
-        
+    
         # Fix the model config to add missing attributes for GPTQ compatibility
         if not hasattr(self.model.config, 'use_cache'):
             logger.info("Adding missing 'use_cache' attribute to model config for GPTQ compatibility")
             self.model.config.use_cache = True
-    
+
         # Prepare calibration data first
         try:
             if dataset_path is None:
@@ -221,118 +221,70 @@ class KosmosQuantizer:
         except Exception as e:
             logger.error(f"Failed to prepare calibration data: {e}")
             raise
+    
+        # GPTQ quantization is often incompatible with multimodal models like Kosmos-2.5
+        # We'll try multiple approaches but inform the user about limitations
+        logger.warning("GPTQ quantization may not be fully compatible with Kosmos-2.5 multimodal architecture.")
+        logger.info("If GPTQ fails, consider using BitsAndBytes quantization which is more reliable.")
         
-        # Try different GPTQ approaches based on compatibility
         quantized_model = None
         
-        # Approach 1: Try optimum GPTQQuantizer with compatibility fixes
+        # Approach 1: Try with simplified config
         try:
-            logger.info("Trying optimum GPTQQuantizer approach...")
+            logger.info("Attempting GPTQ with simplified configuration...")
             
-            # Create quantizer with reduced parameters for better compatibility
+            # Create a custom wrapper to handle the use_cache issue
+            class ConfigWrapper:
+                def __init__(self, original_config):
+                    self._original_config = original_config
+                    self.use_cache = False  # Always False for GPTQ
+                    
+                def __getattr__(self, name):
+                    if name == 'use_cache':
+                        return False
+                    return getattr(self._original_config, name)
+                    
+                def __setattr__(self, name, value):
+                    if name.startswith('_'):
+                        super().__setattr__(name, value)
+                    elif name == 'use_cache':
+                        pass  # Ignore use_cache setting
+                    else:
+                        setattr(self._original_config, name, value)
+            
+            # Temporarily wrap the config
+            original_config = self.model.config
+            self.model.config = ConfigWrapper(original_config)
+            
+            # Create quantizer with minimal settings
             quantizer = GPTQQuantizer(
                 bits=bits,
                 group_size=128,
                 desc_act=False,
-                sym=True,  # Use symmetric quantization
-                true_sequential=True,  # Use sequential quantization
             )
             
-            # Temporarily set use_cache to False during quantization
-            original_use_cache = getattr(self.model.config, 'use_cache', None)
-            self.model.config.use_cache = False
-            
-            # Quantize the model
+            # Attempt quantization
             quantized_model = quantizer.quantize_model(
                 model=self.model, 
                 tokenizer=self.tokenizer
             )
             
-            # Restore original use_cache value
-            if original_use_cache is not None:
-                quantized_model.config.use_cache = original_use_cache
-            else:
-                quantized_model.config.use_cache = True
-                
-            logger.info("Successfully quantized using optimum GPTQQuantizer")
+            # Restore original config
+            quantized_model.config = original_config
+            logger.info("Successfully quantized using optimum GPTQQuantizer with config wrapper")
             
         except Exception as e:
-            logger.warning(f"Optimum GPTQQuantizer failed: {e}")
-            
-            # Approach 2: Try transformers GPTQConfig approach
-            try:
-                logger.info("Trying transformers GPTQConfig approach...")
-                
-                # Prepare calibration dataset in the correct format
-                calibration_dataset_formatted = []
-                for data in calibration_data:
-                    if isinstance(data, dict) and 'input_ids' in data:
-                        # Convert to the format expected by GPTQConfig
-                        calibration_dataset_formatted.append(data['input_ids'].squeeze().tolist())
-                
-                gptq_config = GPTQConfig(
-                    bits=bits,
-                    group_size=128,
-                    desc_act=False,
-                    tokenizer=self.tokenizer,
-                    dataset=calibration_dataset_formatted if calibration_dataset_formatted else "c4",  # Use c4 as fallback
-                    exllama_config={"version": 1},  # Use exllama v1 for better compatibility
-                    max_input_length=512,
-                )
-                
-                # Load model with GPTQ config
-                quantized_model = self.model_class.from_pretrained(
-                    self.model_name,
-                    quantization_config=gptq_config,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=True
-                )
-                
-                logger.info("Successfully quantized using transformers GPTQConfig")
-                
-            except Exception as e2:
-                logger.warning(f"Transformers GPTQConfig approach failed: {e2}")
-                
-                # Approach 3: Manual quantization using AutoGPTQ (if available)
-                try:
-                    logger.info("Trying AutoGPTQ approach...")
-                    
-                    try:
-                        from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-                    except ImportError:
-                        raise ImportError("AutoGPTQ not installed. Install with: pip install auto-gptq")
-                    
-                    # Create quantization config for AutoGPTQ
-                    quantize_config = BaseQuantizeConfig(
-                        bits=bits,
-                        group_size=128,
-                        desc_act=False,
-                    )
-                    
-                    # Load model for AutoGPTQ
-                    model_for_autogptq = AutoGPTQForCausalLM.from_pretrained(
-                        self.model_name,
-                        quantize_config=quantize_config,
-                        trust_remote_code=True
-                    )
-                    
-                    # Quantize
-                    model_for_autogptq.quantize(calibration_data)
-                    quantized_model = model_for_autogptq
-                    
-                    logger.info("Successfully quantized using AutoGPTQ")
-                    
-                except Exception as e3:
-                    logger.error(f"All GPTQ approaches failed. Last error: {e3}")
-                    logger.error("GPTQ quantization is not compatible with this model architecture.")
-                    logger.info("Consider using BitsAndBytes quantization instead:")
-                    logger.info("  python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
-                    raise e3
-    
+            logger.warning(f"GPTQ quantization failed: {e}")
+            logger.error("GPTQ quantization is not compatible with this model architecture.")
+            logger.info("\nRecommended alternatives:")
+            logger.info("1. Use BitsAndBytes 4-bit quantization (most reliable):")
+            logger.info("   python kosmos_quantize.py --method bnb --bits 4 --save_path ./kosmos2.5-bnb4bit")
+            logger.info("2. Use BitsAndBytes 8-bit quantization (faster):")
+            logger.info("   python kosmos_quantize.py --method bnb --bits 8 --save_path ./kosmos2.5-bnb8bit")
+            raise RuntimeError("GPTQ quantization is not supported for this model architecture. Please use BitsAndBytes instead.")
+
         if quantized_model is None:
-            raise RuntimeError("All GPTQ quantization approaches failed")
+            raise RuntimeError("GPTQ quantization failed")
         
         # Create save directory
         os.makedirs(save_path, exist_ok=True)
@@ -349,7 +301,7 @@ class KosmosQuantizer:
             except Exception as e2:
                 logger.error(f"Failed to save model completely: {e2}")
                 raise e2
-        
+    
         # Save tokenizer and processor
         if self.tokenizer:
             try:
@@ -358,16 +310,57 @@ class KosmosQuantizer:
                 logger.info(f"Tokenizer saved to {save_path}")
             except Exception as e:
                 logger.warning(f"Failed to save tokenizer: {e}")
-            
+        
         if self.processor:
             try:
                 self.processor.save_pretrained(save_path)
                 logger.info(f"Processor saved to {save_path}")
             except Exception as e:
                 logger.warning(f"Failed to save processor: {e}")
-        
+    
         logger.info(f"GPTQ {bits}-bit quantized model saved to {save_path}")
         return quantized_model
+
+    def _prepare_calibration_data_for_gptq(self):
+        """Prepare calibration data specifically formatted for GPTQ"""
+        # Create sample prompts for multimodal tasks
+        calibration_prompts = [
+            "<ocr>",
+            "<md>", 
+            "What is in this image?",
+            "Describe the contents of this document.",
+            "Extract the text from this image.",
+            "Please analyze this image.",
+            "What text can you see?",
+            "Convert this to markdown.",
+        ]
+        
+        if not self.tokenizer or not self.processor:
+            self.load_tokenizer_and_processor()
+            
+        # For GPTQ, we need text-only calibration data
+        calibration_data = []
+        for prompt in calibration_prompts:
+            try:
+                # Use text-only tokenization for GPTQ compatibility
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                )
+                
+                # GPTQ typically expects just input_ids
+                if 'input_ids' in inputs:
+                    calibration_data.append({'input_ids': inputs['input_ids']})
+                
+            except Exception as e:
+                logger.warning(f"Failed to process calibration prompt '{prompt}': {e}")
+                continue
+                
+        logger.info(f"Prepared {len(calibration_data)} text-only calibration samples for GPTQ")
+        return calibration_data
     
     def quantize_awq(self, save_path="./kosmos2.5-awq-quantized"):
         """
@@ -661,12 +654,12 @@ class KosmosQuantizer:
                 
             except Exception as e:
                 logger.warning(f"Could not check compatibility: {e}")
-        
+    
         logger.info("Quantization compatibility:")
         for method, compatible in compatibility.items():
             status = "✓ Compatible" if compatible else "✗ May not work"
             logger.info(f"  {method.upper()}: {status}")
-        
+    
         return compatibility
 
 def main():
