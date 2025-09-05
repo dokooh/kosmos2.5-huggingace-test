@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from transformers import (
     AutoTokenizer, 
     AutoProcessor,
-    Kosmos2_5ForConditionalGeneration,
+    AutoModelForImageTextToText,  # Use the correct class
     BitsAndBytesConfig
 )
 import logging
@@ -37,12 +37,55 @@ class FastQuantizer:
         self.processor = None
         self.model = None
         
+        # Determine the correct model class
+        try:
+            from transformers import AutoModelForImageTextToText
+            self.model_class = AutoModelForImageTextToText
+            logger.info("Using AutoModelForImageTextToText")
+        except ImportError:
+            from transformers import AutoModelForVision2Seq
+            self.model_class = AutoModelForVision2Seq
+            logger.info("Using AutoModelForVision2Seq (deprecated)")
+    
     def load_components(self):
         """Load tokenizer, processor, and model"""
         logger.info("Loading model components...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, cache_dir=self.cache_dir)
-        self.processor = AutoProcessor.from_pretrained(self.model_name, cache_dir=self.cache_dir)
         
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, 
+                cache_dir=self.cache_dir,
+                trust_remote_code=True
+            )
+            
+            # Handle padding token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                logger.info("Set pad_token to eos_token")
+                
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer: {e}")
+            raise
+        
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_name, 
+                cache_dir=self.cache_dir,
+                trust_remote_code=True,
+                use_fast=True
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load fast processor, trying slow: {e}")
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_name, 
+                    cache_dir=self.cache_dir,
+                    trust_remote_code=True
+                )
+            except Exception as e2:
+                logger.error(f"Failed to load processor: {e2}")
+                raise
+    
     def method_1_qlora_style(self, save_path="./kosmos2.5-qlora-quantized"):
         """
         QLoRA-style quantization: Fast 4-bit with double quantization
@@ -59,13 +102,14 @@ class FastQuantizer:
             bnb_4bit_quant_storage=torch.uint8,  # Store as uint8 for speed
         )
         
-        self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+        self.model = self.model_class.from_pretrained(
             self.model_name,
             quantization_config=qlora_config,
             device_map="auto",
-            torch_dtype=torch.bfloat16,  # Often faster than float16
+            dtype=torch.bfloat16,  # Use dtype instead of torch_dtype
             cache_dir=self.cache_dir,
             low_cpu_mem_usage=True,  # Faster loading
+            trust_remote_code=True
         )
         
         self._save_model(save_path)
@@ -80,12 +124,13 @@ class FastQuantizer:
         logger.info("Starting FP16 quantization...")
         
         # Load in FP16 directly - fastest approach
-        self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+        self.model = self.model_class.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             cache_dir=self.cache_dir,
             low_cpu_mem_usage=True,
+            trust_remote_code=True
         )
         
         # Ensure all parameters are FP16
@@ -111,12 +156,13 @@ class FastQuantizer:
             llm_int8_skip_modules=["lm_head"],  # Skip quantizing output layer
         )
         
-        self.model = Kosmos2_5ForConditionalGeneration.from_pretrained(
+        self.model = self.model_class.from_pretrained(
             self.model_name,
             quantization_config=mixed_config,
             device_map="auto",
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             cache_dir=self.cache_dir,
+            trust_remote_code=True
         )
         
         self._save_model(save_path)
@@ -293,40 +339,80 @@ class FastQuantizer:
             self.load_components()
             
         inputs = self.tokenizer(dummy_text, return_tensors="pt")
+        
+        # Remove token_type_ids if present (not used by Kosmos-2.5)
+        if 'token_type_ids' in inputs:
+            del inputs['token_type_ids']
+        
+        # Filter out any other problematic keys
+        valid_keys = ['input_ids', 'attention_mask']
+        inputs = {k: v for k, v in inputs.items() if k in valid_keys}
+        
         if torch.cuda.is_available():
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         # Warm up
         with torch.no_grad():
             for _ in range(5):
-                _ = model.generate(**inputs, max_length=30, do_sample=False)
+                try:
+                    _ = model.generate(
+                        **inputs, 
+                        max_length=30, 
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                except Exception as e:
+                    logger.warning(f"Warmup iteration failed: {e}")
+                    break
         
         # Benchmark
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         start_time = time.time()
         
+        successful_iterations = 0
         with torch.no_grad():
-            for _ in range(iterations):
-                outputs = model.generate(**inputs, max_length=30, do_sample=False)
+            for i in range(iterations):
+                try:
+                    outputs = model.generate(
+                        **inputs, 
+                        max_length=30, 
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                    successful_iterations += 1
+                except Exception as e:
+                    logger.warning(f"Iteration {i} failed: {e}")
+                    continue
         
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         end_time = time.time()
         
-        avg_time = (end_time - start_time) / iterations
-        tokens_per_sec = (30 * iterations) / (end_time - start_time)  # Approximate
+        if successful_iterations == 0:
+            logger.error("All benchmark iterations failed")
+            return {
+                "avg_inference_time": float('inf'),
+                "tokens_per_second": 0,
+                "memory_mb": None
+            }
+        
+        avg_time = (end_time - start_time) / successful_iterations
+        tokens_per_sec = (30 * successful_iterations) / (end_time - start_time)  # Approximate
         
         # Memory usage
+        memory_mb = None
         if torch.cuda.is_available():
             memory_mb = torch.cuda.max_memory_allocated() / 1024**2
             logger.info(f"GPU Memory: {memory_mb:.0f} MB")
         
+        logger.info(f"Successful iterations: {successful_iterations}/{iterations}")
         logger.info(f"Average inference time: {avg_time:.3f}s")
         logger.info(f"Tokens per second: {tokens_per_sec:.1f}")
         
         return {
             "avg_inference_time": avg_time,
             "tokens_per_second": tokens_per_sec,
-            "memory_mb": memory_mb if torch.cuda.is_available() else None
+            "memory_mb": memory_mb,
+            "successful_iterations": successful_iterations
         }
 
 def main():
