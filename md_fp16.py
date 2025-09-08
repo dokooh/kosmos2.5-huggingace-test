@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Optimized Markdown Generation Inference Module for Kosmos-2.5 with FP16 Quantization
+Optimized Markdown Generation Inference Module for Kosmos-2.5 with SafeTensors
 
-This module provides fast markdown generation using FP16 quantized Kosmos-2.5 model.
+This module provides fast markdown generation using optimized Kosmos-2.5 model.
 Features:
-- FP16 quantization for faster inference
+- SafeTensors format for faster loading
+- bfloat16/float16 quantization for optimal performance
 - Optimized memory usage
 - Enhanced markdown post-processing
 - Batch processing support
@@ -32,46 +33,112 @@ class OptimizedMarkdownInference:
         self.cache_dir = cache_dir
         self.model = None
         self.processor = None
-        self.dtype = torch.float16 if self.device.startswith('cuda') else torch.float32
+        
+        # Use bfloat16 for better performance on modern hardware, fallback to float16
+        if self.device.startswith('cuda') and torch.cuda.is_bf16_supported():
+            self.dtype = torch.bfloat16
+            logger.info("Using bfloat16 for optimal performance")
+        elif self.device.startswith('cuda'):
+            self.dtype = torch.float16
+            logger.info("Using float16 (bfloat16 not supported)")
+        else:
+            self.dtype = torch.float32
+            logger.info("Using float32 for CPU")
         
         logger.info(f"Initializing Markdown inference on {self.device} with {self.dtype}")
     
     def load_model(self):
-        """Load FP16 quantized model for optimal performance"""
+        """Load model with SafeTensors and optimized parameters for faster loading"""
         if self.model is not None:
             return
             
-        logger.info("Loading FP16 quantized Kosmos-2.5 model...")
+        logger.info("Loading optimized Kosmos-2.5 model with SafeTensors...")
         try:
-            # Load with FP16 quantization for speed
+            # Add these parameters for faster model loading and better performance
             self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_name,
-                torch_dtype=self.dtype,
-                device_map="auto" if self.device.startswith('cuda') else None,
+                low_cpu_mem_usage=True,          # Reduces CPU memory during loading
+                use_safetensors=True,            # Faster file format
+                device_map="auto",               # Automatic device placement
+                torch_dtype=self.dtype,          # Often faster than float16
                 cache_dir=self.cache_dir,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
+                trust_remote_code=True,
+                local_files_only=False,          # Allow downloading if not local
+                resume_download=True,            # Resume interrupted downloads
+                # Additional optimizations
+                attn_implementation="flash_attention_2" if hasattr(torch.nn, 'scaled_dot_product_attention') else None,
             )
             
-            # Ensure model is in FP16 for CUDA
+            # Ensure model is in the correct dtype
             if self.device.startswith('cuda'):
-                self.model = self.model.half()
-                
+                if self.dtype == torch.bfloat16:
+                    self.model = self.model.bfloat16()
+                else:
+                    self.model = self.model.half()
+                    
+            # Load processor with optimizations
             self.processor = AutoProcessor.from_pretrained(
                 self.model_name,
                 cache_dir=self.cache_dir,
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_fast=True,                   # Use fast tokenizer when available
+                local_files_only=False,
+                resume_download=True
             )
             
             # Set pad token if not present
             if self.processor.tokenizer.pad_token is None:
                 self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+                logger.info("Set pad_token to eos_token")
                 
-            logger.info("Model loaded successfully")
+            # Enable model optimizations
+            if hasattr(self.model, 'eval'):
+                self.model.eval()
+                
+            # Enable torch.compile for PyTorch 2.0+ (if available)
+            if hasattr(torch, 'compile') and self.device.startswith('cuda'):
+                try:
+                    logger.info("Compiling model with torch.compile for faster inference...")
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
+                except Exception as e:
+                    logger.warning(f"torch.compile failed, continuing without it: {e}")
+                
+            logger.info("Model loaded successfully with optimizations")
+            
+            # Print model info
+            if hasattr(self.model, 'num_parameters'):
+                try:
+                    num_params = sum(p.numel() for p in self.model.parameters())
+                    logger.info(f"Model parameters: {num_params:,}")
+                except:
+                    pass
             
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
-            raise
+            # Fallback to basic loading
+            logger.info("Attempting fallback model loading...")
+            try:
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    self.model_name,
+                    torch_dtype=self.dtype,
+                    cache_dir=self.cache_dir,
+                    trust_remote_code=True
+                )
+                
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_name,
+                    cache_dir=self.cache_dir,
+                    trust_remote_code=True
+                )
+                
+                if self.processor.tokenizer.pad_token is None:
+                    self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+                    
+                logger.info("Fallback model loading successful")
+                
+            except Exception as e2:
+                logger.error(f"Fallback loading also failed: {e2}")
+                raise
     
     def load_image(self, image_path):
         """Load image from local path or URL with error handling"""
@@ -108,12 +175,14 @@ class OptimizedMarkdownInference:
     
     def clean_markdown(self, text):
         """Clean and format markdown text"""
-        # Remove extra whitespace
+        # Remove extra whitespace and clean up
         lines = text.split('\n')
         cleaned_lines = []
         
         for line in lines:
             line = line.strip()
+            # Remove any remaining HTML-like tags
+            line = re.sub(r'<[^>]+>', '', line)
             if line:  # Skip empty lines initially
                 cleaned_lines.append(line)
         
@@ -121,7 +190,7 @@ class OptimizedMarkdownInference:
         text = '\n'.join(cleaned_lines)
         
         # Fix common markdown formatting issues
-        # Fix headers
+        # Fix headers - ensure proper spacing
         text = re.sub(r'^#{1,6}\s*', lambda m: m.group(0).rstrip() + ' ', text, flags=re.MULTILINE)
         
         # Ensure proper spacing around headers
@@ -133,6 +202,10 @@ class OptimizedMarkdownInference:
         
         # Fix table formatting
         text = re.sub(r'\|([^|]+)\|', lambda m: '|' + m.group(1).strip() + '|', text)
+        
+        # Fix emphasis and strong formatting
+        text = re.sub(r'\*\*([^*]+)\*\*', r'**\1**', text)
+        text = re.sub(r'\*([^*]+)\*', r'*\1*', text)
         
         # Remove excessive newlines
         text = re.sub(r'\n{3,}', '\n\n', text)
@@ -161,7 +234,7 @@ class OptimizedMarkdownInference:
             inputs.pop("height", None)
             inputs.pop("width", None)
             
-            # Move inputs to device
+            # Move inputs to device and convert to correct dtype
             inputs = {k: v.to(self.device) if v is not None else None for k, v in inputs.items()}
             
             # Convert flattened_patches to correct dtype
@@ -171,16 +244,34 @@ class OptimizedMarkdownInference:
             # Generate markdown
             logger.info("Generating markdown...")
             with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    do_sample=temperature > 0,
-                    temperature=temperature if temperature > 0 else None,
-                    pad_token_id=self.processor.tokenizer.eos_token_id,
-                    eos_token_id=self.processor.tokenizer.eos_token_id,
-                    repetition_penalty=1.1,
-                    length_penalty=1.0
-                )
+                # Use torch.cuda.amp for potential speedup
+                if self.device.startswith('cuda'):
+                    with torch.cuda.amp.autocast(dtype=self.dtype):
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            max_new_tokens=max_tokens,
+                            do_sample=temperature > 0,
+                            temperature=temperature if temperature > 0 else None,
+                            pad_token_id=self.processor.tokenizer.eos_token_id,
+                            eos_token_id=self.processor.tokenizer.eos_token_id,
+                            repetition_penalty=1.1,
+                            length_penalty=1.0,
+                            use_cache=True,
+                            num_beams=1 if temperature > 0 else 1,  # Use greedy for deterministic
+                        )
+                else:
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_tokens,
+                        do_sample=temperature > 0,
+                        temperature=temperature if temperature > 0 else None,
+                        pad_token_id=self.processor.tokenizer.eos_token_id,
+                        eos_token_id=self.processor.tokenizer.eos_token_id,
+                        repetition_penalty=1.1,
+                        length_penalty=1.0,
+                        use_cache=True,
+                        num_beams=1,
+                    )
             
             # Decode results
             generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -229,6 +320,7 @@ class OptimizedMarkdownInference:
             self.load_model()
         
         results = []
+        os.makedirs(output_dir, exist_ok=True)
         
         for i, image_path in enumerate(image_paths, 1):
             logger.info(f"Processing image {i}/{len(image_paths)}: {image_path}")
@@ -261,7 +353,7 @@ class OptimizedMarkdownInference:
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='Optimized Markdown generation using FP16 quantized Kosmos-2.5')
+    parser = argparse.ArgumentParser(description='Optimized Markdown generation using Kosmos-2.5 with SafeTensors')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--output', '-o', type=str, default='./output.md',
@@ -314,13 +406,15 @@ def main():
             # Print summary
             successful = sum(1 for r in results if 'error' not in r)
             total_time = sum(r.get('inference_time', 0) for r in results)
+            total_words = sum(r.get('word_count', 0) for r in results if 'error' not in r)
             
             print(f"\n{'='*60}")
-            print("BATCH PROCESSING SUMMARY")
+            print("BATCH MARKDOWN PROCESSING SUMMARY")
             print(f"{'='*60}")
             print(f"Total images processed: {len(results)}")
             print(f"Successful: {successful}")
             print(f"Failed: {len(results) - successful}")
+            print(f"Total words generated: {total_words}")
             print(f"Total processing time: {total_time:.2f}s")
             print(f"Average time per image: {total_time/len(results):.2f}s")
             print(f"{'='*60}")
