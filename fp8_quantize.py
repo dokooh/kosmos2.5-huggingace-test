@@ -3,7 +3,7 @@
 FP8 Quantization for Kosmos-2.5 - Simplified Version with PyTorch/Transformers Fix
 
 This script implements FP8 quantization for Kosmos-2.5 without dependency management.
-Handles PyTorch/Transformers version compatibility issues.
+Handles PyTorch/Transformers version compatibility issues and tokenizer loading issues.
 
 Requirements:
 - PyTorch >= 2.1.0 with CUDA support
@@ -17,6 +17,8 @@ import time
 import argparse
 import traceback
 import warnings
+import json
+import shutil
 
 # Suppress NumPy and other warnings that might interfere
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
@@ -212,6 +214,57 @@ def safe_import_transformers():
         debug_print(f"✗ All import strategies failed: {e2}", "ERROR")
         raise ImportError("Could not import transformers with any strategy")
 
+def fix_tokenizer_cache(model_name, cache_dir=None):
+    """Fix corrupted tokenizer cache files"""
+    debug_print("Attempting to fix tokenizer cache issues...", "INFO")
+    
+    try:
+        from transformers import TRANSFORMERS_CACHE
+        from transformers.utils import cached_file
+        
+        # Get the actual cache directory
+        if cache_dir:
+            cache_path = cache_dir
+        else:
+            cache_path = TRANSFORMERS_CACHE
+        
+        debug_print(f"Cache directory: {cache_path}", "DEBUG")
+        
+        # Try to find and remove corrupted tokenizer files
+        model_cache_dirs = []
+        if os.path.exists(cache_path):
+            for item in os.listdir(cache_path):
+                item_path = os.path.join(cache_path, item)
+                if os.path.isdir(item_path) and any(part in item for part in model_name.split('/')):
+                    model_cache_dirs.append(item_path)
+        
+        for cache_dir_path in model_cache_dirs:
+            debug_print(f"Checking cache directory: {cache_dir_path}", "DEBUG")
+            
+            # Look for tokenizer.json and remove if corrupted
+            tokenizer_json_path = os.path.join(cache_dir_path, "tokenizer.json")
+            if os.path.exists(tokenizer_json_path):
+                try:
+                    with open(tokenizer_json_path, 'r', encoding='utf-8') as f:
+                        json.load(f)  # Try to parse JSON
+                    debug_print(f"✓ Tokenizer JSON is valid: {tokenizer_json_path}", "DEBUG")
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    debug_print(f"⚠ Corrupted tokenizer.json found, removing: {tokenizer_json_path}", "WARNING")
+                    os.remove(tokenizer_json_path)
+                except Exception as e:
+                    debug_print(f"⚠ Error checking tokenizer.json: {e}", "WARNING")
+                    try:
+                        os.remove(tokenizer_json_path)
+                        debug_print(f"✓ Removed problematic tokenizer.json", "INFO")
+                    except:
+                        pass
+        
+        return True
+        
+    except Exception as e:
+        debug_print(f"⚠ Tokenizer cache fix failed: {e}", "WARNING")
+        return False
+
 class SimpleKosmosQuantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
         debug_print(f"Initializing SimpleKosmosQuantizer...", "INFO")
@@ -257,22 +310,81 @@ class SimpleKosmosQuantizer:
             raise ImportError("Transformers not available")
     
     def load_tokenizer_and_processor(self):
-        """Load tokenizer and processor"""
+        """Load tokenizer and processor with fallback strategies"""
         debug_print("Loading tokenizer and processor...", "INFO")
         
+        # Strategy 1: Try normal loading
         try:
-            # Since we pre-imported, this should work now
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 cache_dir=self.cache_dir,
                 trust_remote_code=True
             )
-            debug_print("✓ Tokenizer loaded", "INFO")
+            debug_print("✓ Tokenizer loaded successfully", "INFO")
         except Exception as e:
-            debug_print(f"✗ Tokenizer loading failed: {e}", "ERROR")
-            raise
+            if "ModelWrapper" in str(e) or "untagged enum" in str(e):
+                debug_print("⚠ Tokenizer corruption detected, trying cache fix...", "WARNING")
+                
+                # Strategy 2: Fix cache and retry
+                fix_tokenizer_cache(self.model_name, self.cache_dir)
+                
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        self.model_name,
+                        cache_dir=self.cache_dir,
+                        trust_remote_code=True,
+                        force_download=True  # Force re-download
+                    )
+                    debug_print("✓ Tokenizer loaded after cache fix", "INFO")
+                except Exception as e2:
+                    debug_print(f"⚠ Cache fix failed, trying slow tokenizer: {e2}", "WARNING")
+                    
+                    # Strategy 3: Try slow tokenizer
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(
+                            self.model_name,
+                            cache_dir=self.cache_dir,
+                            trust_remote_code=True,
+                            use_fast=False  # Use slow tokenizer
+                        )
+                        debug_print("✓ Slow tokenizer loaded successfully", "INFO")
+                    except Exception as e3:
+                        debug_print(f"⚠ Slow tokenizer failed, trying minimal config: {e3}", "WARNING")
+                        
+                        # Strategy 4: Minimal tokenizer loading
+                        try:
+                            from transformers import PreTrainedTokenizerFast, GPT2TokenizerFast
+                            
+                            # Try fallback tokenizers
+                            fallback_tokenizers = [
+                                "microsoft/DialoGPT-medium",
+                                "gpt2",
+                                "bert-base-uncased"
+                            ]
+                            
+                            for fallback in fallback_tokenizers:
+                                try:
+                                    debug_print(f"Trying fallback tokenizer: {fallback}", "DEBUG")
+                                    self.tokenizer = AutoTokenizer.from_pretrained(
+                                        fallback,
+                                        trust_remote_code=False
+                                    )
+                                    debug_print(f"✓ Fallback tokenizer loaded: {fallback}", "WARNING")
+                                    break
+                                except:
+                                    continue
+                            else:
+                                raise Exception("All tokenizer strategies failed")
+                                
+                        except Exception as e4:
+                            debug_print(f"✗ All tokenizer strategies failed: {e4}", "ERROR")
+                            raise
+            else:
+                debug_print(f"✗ Tokenizer loading failed: {e}", "ERROR")
+                raise
         
+        # Load processor (optional)
         try:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(
@@ -470,8 +582,16 @@ def main():
     parser.add_argument('--cache_dir', 
                        default=None,
                        help='Cache directory for model downloads')
+    parser.add_argument('--clear_cache', 
+                       action='store_true',
+                       help='Clear model cache before loading')
     
     args = parser.parse_args()
+    
+    # Clear cache if requested
+    if args.clear_cache:
+        debug_print("Clearing model cache as requested...", "INFO")
+        fix_tokenizer_cache(args.model_name, args.cache_dir)
     
     try:
         # Initialize quantizer
