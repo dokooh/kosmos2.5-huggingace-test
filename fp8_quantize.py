@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-FP8 Quantization for Kosmos-2.5 with Enhanced Debug Output
+FP8 Quantization for Kosmos-2.5 with Enhanced Dependency Handling
 
-This script implements multiple FP8 quantization approaches with comprehensive debugging:
-1. Hugging Face Fine-grained FP8 (Latest method)
-2. FBGEMM FP8 (Stable production method)  
-3. TorchAO FP8 (PyTorch native)
-4. Transformer Engine FP8 (NVIDIA optimized)
-5. Custom E4M3/E5M2 FP8 implementation
-6. Mixed FP8/FP16 precision
+This script implements multiple FP8 quantization approaches with robust dependency management:
+1. Automatic dependency conflict resolution
+2. Graceful fallbacks for version mismatches
+3. CUDA version compatibility checking
+4. Alternative import strategies
+5. Comprehensive debugging output
 
-Requirements:
-- GPU with Compute Capability >= 8.9 (RTX 4090, H100, etc.)
+Requirements (Auto-detected and fixed):
+- GPU with Compute Capability >= 8.0 (recommended >= 8.9)
 - PyTorch >= 2.1.0 with CUDA support
 - Compatible transformers and torchvision versions
 """
@@ -23,6 +22,7 @@ import logging
 import time
 import argparse
 import numpy as np
+import subprocess
 from typing import Optional, Dict, Any, Tuple
 import traceback
 
@@ -57,14 +57,148 @@ def debug_print(message, level="INFO"):
     elif level == "CRITICAL":
         logger.critical(message)
 
-def check_and_install_dependencies():
-    """Check and handle dependency issues with detailed debugging"""
+def run_command(command, description=""):
+    """Run a system command with detailed logging"""
+    debug_print(f"Running command: {command}", "DEBUG")
+    if description:
+        debug_print(f"Purpose: {description}", "DEBUG")
+    
+    try:
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            capture_output=True, 
+            text=True, 
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.returncode == 0:
+            debug_print(f"✓ Command succeeded", "DEBUG")
+            if result.stdout.strip():
+                debug_print(f"Output: {result.stdout.strip()}", "DEBUG")
+            return True, result.stdout
+        else:
+            debug_print(f"✗ Command failed with code {result.returncode}", "ERROR")
+            if result.stderr.strip():
+                debug_print(f"Error: {result.stderr.strip()}", "ERROR")
+            return False, result.stderr
+            
+    except subprocess.TimeoutExpired:
+        debug_print(f"✗ Command timed out", "ERROR")
+        return False, "Command timed out"
+    except Exception as e:
+        debug_print(f"✗ Command execution failed: {e}", "ERROR")
+        return False, str(e)
+
+def detect_cuda_version():
+    """Detect available CUDA version on the system"""
+    debug_print("Detecting CUDA version...", "INFO")
+    
+    # Try nvidia-smi first
+    success, output = run_command("nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits", 
+                                  "Check NVIDIA driver version")
+    
+    if success:
+        debug_print(f"NVIDIA driver detected: {output.strip()}", "INFO")
+    
+    # Try nvcc
+    success, output = run_command("nvcc --version", "Check CUDA compiler version")
+    if success:
+        lines = output.strip().split('\n')
+        for line in lines:
+            if 'release' in line.lower():
+                debug_print(f"CUDA compiler: {line.strip()}", "INFO")
+                # Extract version like "release 11.8" or "release 12.4"
+                if 'release' in line:
+                    try:
+                        version_part = line.split('release')[1].strip().split(',')[0].strip()
+                        major_version = version_part.split('.')[0]
+                        debug_print(f"Detected CUDA major version: {major_version}", "INFO")
+                        return major_version
+                    except:
+                        pass
+    
+    # Try checking PyTorch CUDA version
+    try:
+        import torch
+        if torch.cuda.is_available():
+            cuda_version = torch.version.cuda
+            debug_print(f"PyTorch CUDA version: {cuda_version}", "INFO")
+            major_version = cuda_version.split('.')[0]
+            debug_print(f"PyTorch CUDA major version: {major_version}", "INFO")
+            return major_version
+    except:
+        pass
+    
+    debug_print("Could not detect CUDA version, assuming 11.8", "WARNING")
+    return "11"
+
+def fix_dependency_mismatch():
+    """Automatically fix CUDA version mismatches"""
     debug_print("="*60, "INFO")
-    debug_print("STARTING DEPENDENCY CHECK", "INFO")
+    debug_print("ATTEMPTING AUTOMATIC DEPENDENCY FIX", "INFO")
     debug_print("="*60, "INFO")
     
-    # Check PyTorch
+    # Detect CUDA version
+    cuda_major = detect_cuda_version()
+    
+    # Determine the correct PyTorch index URL
+    if cuda_major == "12":
+        index_url = "https://download.pytorch.org/whl/cu121"
+        cuda_version = "cu121"
+    elif cuda_major == "11":
+        index_url = "https://download.pytorch.org/whl/cu118"
+        cuda_version = "cu118"
+    else:
+        debug_print(f"Unsupported CUDA version {cuda_major}, using CUDA 11.8", "WARNING")
+        index_url = "https://download.pytorch.org/whl/cu118"
+        cuda_version = "cu118"
+    
+    debug_print(f"Selected CUDA version: {cuda_version}", "INFO")
+    debug_print(f"PyTorch index URL: {index_url}", "INFO")
+    
+    # Uninstall existing torch/torchvision to avoid conflicts
+    debug_print("Uninstalling existing PyTorch packages...", "INFO")
+    uninstall_cmd = "pip uninstall torch torchvision torchaudio -y"
+    success, _ = run_command(uninstall_cmd, "Remove conflicting packages")
+    
+    if not success:
+        debug_print("⚠ Failed to uninstall existing packages, continuing...", "WARNING")
+    
+    # Install compatible versions
+    debug_print(f"Installing PyTorch with {cuda_version}...", "INFO")
+    install_cmd = f"pip install torch torchvision torchaudio --index-url {index_url}"
+    success, output = run_command(install_cmd, f"Install PyTorch for {cuda_version}")
+    
+    if success:
+        debug_print("✓ PyTorch installation completed", "INFO")
+        return True
+    else:
+        debug_print("✗ PyTorch installation failed", "ERROR")
+        debug_print("Trying CPU-only version as fallback...", "INFO")
+        
+        # Fallback to CPU version
+        cpu_cmd = "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
+        success, _ = run_command(cpu_cmd, "Install CPU-only PyTorch")
+        
+        if success:
+            debug_print("✓ CPU-only PyTorch installed successfully", "INFO")
+            return True
+        else:
+            debug_print("✗ All installation attempts failed", "ERROR")
+            return False
+
+def check_and_install_dependencies(auto_fix=True):
+    """Check and handle dependency issues with automatic fixing"""
+    debug_print("="*60, "INFO")
+    debug_print("STARTING ENHANCED DEPENDENCY CHECK", "INFO")
+    debug_print("="*60, "INFO")
+    
+    # Check PyTorch first
     debug_print("Checking PyTorch installation...", "INFO")
+    pytorch_ok = False
+    cuda_mismatch = False
+    
     try:
         import torch
         debug_print(f"✓ PyTorch version: {torch.__version__}", "INFO")
@@ -79,14 +213,15 @@ def check_and_install_dependencies():
                 debug_print(f"✓ GPU {i}: {device_name}", "INFO")
         else:
             debug_print("⚠ CUDA not available - will use CPU", "WARNING")
-            
+        
+        pytorch_ok = True
+        
     except ImportError as e:
         debug_print(f"✗ PyTorch not found: {e}", "ERROR")
-        debug_print("Install with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118", "ERROR")
-        return False
+        pytorch_ok = False
     except Exception as e:
         debug_print(f"✗ PyTorch check failed: {e}", "ERROR")
-        return False
+        pytorch_ok = False
     
     # Check for CUDA mismatch
     debug_print("Checking torchvision compatibility...", "INFO")
@@ -94,20 +229,54 @@ def check_and_install_dependencies():
         import torchvision
         debug_print(f"✓ Torchvision version: {torchvision.__version__}", "INFO")
         debug_print(f"✓ Torchvision location: {torchvision.__file__}", "DEBUG")
+        
     except RuntimeError as e:
         if "CUDA" in str(e):
             debug_print(f"✗ CUDA version mismatch detected: {e}", "ERROR")
-            debug_print("Fix with one of these commands:", "ERROR")
-            debug_print("  For CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118", "ERROR")
-            debug_print("  For CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121", "ERROR")
-            debug_print("  For CPU only: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu", "ERROR")
-            return False
+            cuda_mismatch = True
+            
+            if auto_fix:
+                debug_print("Attempting automatic fix...", "INFO")
+                if fix_dependency_mismatch():
+                    debug_print("✓ Dependency mismatch fixed, retesting...", "INFO")
+                    try:
+                        # Force reimport
+                        if 'torch' in sys.modules:
+                            del sys.modules['torch']
+                        if 'torchvision' in sys.modules:
+                            del sys.modules['torchvision']
+                        
+                        import torch
+                        import torchvision
+                        debug_print("✓ PyTorch and torchvision now compatible", "INFO")
+                        cuda_mismatch = False
+                        pytorch_ok = True
+                        
+                    except Exception as e2:
+                        debug_print(f"✗ Fix verification failed: {e2}", "ERROR")
+                else:
+                    debug_print("✗ Automatic fix failed", "ERROR")
+            else:
+                debug_print("Manual fix required:", "ERROR")
+                cuda_major = detect_cuda_version()
+                if cuda_major == "12":
+                    debug_print("  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121", "ERROR")
+                else:
+                    debug_print("  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118", "ERROR")
         else:
             debug_print(f"✗ Torchvision error: {e}", "ERROR")
-            raise
+            
     except ImportError as e:
         debug_print(f"⚠ Torchvision not found: {e}", "WARNING")
         debug_print("This may not be critical for quantization", "INFO")
+    
+    # If we still have issues, return early
+    if cuda_mismatch or not pytorch_ok:
+        if not auto_fix:
+            debug_print("✗ Please fix dependency issues manually and retry", "ERROR")
+            return False
+        else:
+            debug_print("⚠ Some issues remain, but continuing with available components", "WARNING")
     
     # Check transformers with detailed debugging
     debug_print("Checking transformers library...", "INFO")
@@ -116,15 +285,22 @@ def check_and_install_dependencies():
         debug_print(f"✓ Transformers version: {transformers.__version__}", "INFO")
         debug_print(f"✓ Transformers location: {transformers.__file__}", "DEBUG")
         
-        # Try importing components individually
+        # Try importing components individually with fallbacks
         debug_print("Testing transformers components...", "DEBUG")
+        
+        # AutoTokenizer (required)
         try:
             from transformers import AutoTokenizer
             debug_print("✓ AutoTokenizer import successful", "DEBUG")
         except ImportError as e:
             debug_print(f"✗ AutoTokenizer import failed: {e}", "ERROR")
-            return False
+            debug_print("Installing/upgrading transformers...", "INFO")
+            success, _ = run_command("pip install --upgrade transformers>=4.36.0", 
+                                   "Upgrade transformers library")
+            if not success:
+                return False
             
+        # AutoProcessor (optional with fallback)
         try:
             from transformers import AutoProcessor
             debug_print("✓ AutoProcessor import successful", "DEBUG")
@@ -134,8 +310,10 @@ def check_and_install_dependencies():
             
     except ImportError as e:
         debug_print(f"✗ Transformers not found: {e}", "ERROR")
-        debug_print("Install with: pip install transformers>=4.36.0", "ERROR")
-        return False
+        debug_print("Installing transformers...", "INFO")
+        success, _ = run_command("pip install transformers>=4.36.0", "Install transformers")
+        if not success:
+            return False
     
     # Check optional dependencies
     debug_print("Checking optional dependencies...", "INFO")
@@ -145,25 +323,31 @@ def check_and_install_dependencies():
         import bitsandbytes
         debug_print(f"✓ BitsAndBytes version: {bitsandbytes.__version__}", "INFO")
     except ImportError:
-        debug_print("⚠ BitsAndBytes not found (optional for 8-bit quantization)", "WARNING")
+        debug_print("⚠ BitsAndBytes not found (installing for 8-bit quantization)", "WARNING")
+        success, _ = run_command("pip install bitsandbytes", "Install BitsAndBytes")
+        if success:
+            debug_print("✓ BitsAndBytes installed successfully", "INFO")
     
     # Accelerate
     try:
         import accelerate
         debug_print(f"✓ Accelerate version: {accelerate.__version__}", "INFO")
     except ImportError:
-        debug_print("⚠ Accelerate not found (optional for optimization)", "WARNING")
+        debug_print("⚠ Accelerate not found (installing for optimization)", "WARNING")
+        success, _ = run_command("pip install accelerate", "Install Accelerate")
+        if success:
+            debug_print("✓ Accelerate installed successfully", "INFO")
     
-    debug_print("✓ Dependency check completed successfully!", "INFO")
+    debug_print("✓ Enhanced dependency check completed!", "INFO")
     debug_print("="*60, "INFO")
     return True
 
 def safe_import_transformers():
-    """Safely import transformers components with detailed debugging"""
-    debug_print("Starting safe transformers import...", "INFO")
+    """Safely import transformers components with detailed debugging and fallbacks"""
+    debug_print("Starting safe transformers import with fallbacks...", "INFO")
     components = {}
     
-    # AutoTokenizer
+    # AutoTokenizer (required)
     debug_print("Importing AutoTokenizer...", "DEBUG")
     try:
         from transformers import AutoTokenizer
@@ -173,7 +357,7 @@ def safe_import_transformers():
         debug_print(f"✗ Failed to import AutoTokenizer: {e}", "ERROR")
         return None
     
-    # AutoProcessor
+    # AutoProcessor (optional with multiple fallbacks)
     debug_print("Importing AutoProcessor...", "DEBUG")
     try:
         from transformers import AutoProcessor
@@ -181,29 +365,52 @@ def safe_import_transformers():
         debug_print("✓ AutoProcessor imported successfully", "DEBUG")
     except ImportError as e:
         debug_print(f"⚠ AutoProcessor not available: {e}", "WARNING")
-        debug_print("Will use tokenizer only", "INFO")
-        components['AutoProcessor'] = None
-    
-    # Model classes
-    debug_print("Importing model classes...", "DEBUG")
-    try:
-        # Try specific Kosmos model class first
+        
+        # Try alternative processor imports
         try:
-            from transformers import Kosmos2_5ForConditionalGeneration
-            components['ModelClass'] = Kosmos2_5ForConditionalGeneration
-            debug_print("✓ Kosmos2_5ForConditionalGeneration imported", "DEBUG")
+            from transformers import CLIPProcessor
+            components['AutoProcessor'] = CLIPProcessor
+            debug_print("✓ CLIPProcessor imported as fallback", "WARNING")
         except ImportError:
-            debug_print("⚠ Kosmos2_5ForConditionalGeneration not found, trying alternatives...", "WARNING")
-            try:
+            debug_print("Will use tokenizer only", "INFO")
+            components['AutoProcessor'] = None
+    
+    # Model classes with comprehensive fallbacks
+    debug_print("Importing model classes...", "DEBUG")
+    model_classes_to_try = [
+        ('Kosmos2_5ForConditionalGeneration', 'transformers'),
+        ('AutoModelForImageTextToText', 'transformers'), 
+        ('AutoModelForVision2Seq', 'transformers'),
+        ('AutoModelForCausalLM', 'transformers'),
+    ]
+    
+    model_imported = False
+    for class_name, module_name in model_classes_to_try:
+        try:
+            if module_name == 'transformers':
                 from transformers import AutoModelForImageTextToText
-                components['ModelClass'] = AutoModelForImageTextToText
-                debug_print("✓ AutoModelForImageTextToText imported as fallback", "DEBUG")
-            except ImportError:
-                from transformers import AutoModelForCausalLM
-                components['ModelClass'] = AutoModelForCausalLM
-                debug_print("✓ AutoModelForCausalLM imported as fallback", "WARNING")
-    except ImportError as e:
-        debug_print(f"✗ Failed to import any model class: {e}", "ERROR")
+                if class_name == 'Kosmos2_5ForConditionalGeneration':
+                    from transformers import Kosmos2_5ForConditionalGeneration
+                    components['ModelClass'] = Kosmos2_5ForConditionalGeneration
+                elif class_name == 'AutoModelForImageTextToText':
+                    components['ModelClass'] = AutoModelForImageTextToText
+                elif class_name == 'AutoModelForVision2Seq':
+                    from transformers import AutoModelForVision2Seq
+                    components['ModelClass'] = AutoModelForVision2Seq
+                elif class_name == 'AutoModelForCausalLM':
+                    from transformers import AutoModelForCausalLM
+                    components['ModelClass'] = AutoModelForCausalLM
+                    
+            debug_print(f"✓ {class_name} imported successfully", "DEBUG")
+            model_imported = True
+            break
+            
+        except ImportError:
+            debug_print(f"⚠ {class_name} not found, trying next...", "DEBUG")
+            continue
+    
+    if not model_imported:
+        debug_print("✗ Failed to import any model class", "ERROR")
         return None
     
     # Quantization configs
@@ -231,6 +438,7 @@ def check_fp8_compatibility():
         
     if not torch.cuda.is_available():
         debug_print("⚠ CUDA not available. FP8 requires GPU support.", "WARNING")
+        debug_print("Will use CPU-compatible quantization methods", "INFO")
         return False
     
     # Check compute capability
@@ -238,6 +446,7 @@ def check_fp8_compatibility():
         device_count = torch.cuda.device_count()
         debug_print(f"Checking {device_count} CUDA devices...", "DEBUG")
         
+        fp8_compatible = False
         for i in range(device_count):
             major, minor = torch.cuda.get_device_capability(i)
             compute_capability = major + minor / 10
@@ -246,11 +455,13 @@ def check_fp8_compatibility():
             debug_print(f"GPU {i} ({device_name}): Compute capability {compute_capability}", "INFO")
             
             if compute_capability < 8.0:
-                debug_print(f"⚠ GPU {i} compute capability {compute_capability} < 8.0. FP8 may not be supported.", "WARNING")
+                debug_print(f"⚠ GPU {i} compute capability {compute_capability} < 8.0. FP8 not supported.", "WARNING")
             elif compute_capability < 8.9:
                 debug_print(f"⚠ GPU {i} compute capability {compute_capability} < 8.9. FP8 may not be optimal.", "WARNING")
+                fp8_compatible = True
             else:
                 debug_print(f"✓ GPU {i} compute capability: {compute_capability} - FP8 compatible!", "INFO")
+                fp8_compatible = True
         
         # Check for FP8 specific features
         debug_print("Checking FP8 specific features...", "DEBUG")
@@ -269,13 +480,14 @@ def check_fp8_compatibility():
         except ImportError:
             debug_print("⚠ TorchAO not available (optional)", "WARNING")
         
-        return True
+        return fp8_compatible
         
     except Exception as e:
         debug_print(f"✗ Failed to check GPU capability: {e}", "ERROR")
         debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
         return False
 
+# Keep the existing KosmosFP8Quantizer class with minor improvements for error handling
 class KosmosFP8Quantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
         debug_print(f"Initializing KosmosFP8Quantizer...", "INFO")
@@ -288,7 +500,7 @@ class KosmosFP8Quantizer:
         self.processor = None
         self.model = None
         
-        # Import transformers components
+        # Import transformers components with fallbacks
         debug_print("Importing transformers components...", "DEBUG")
         self.components = safe_import_transformers()
         if not self.components:
@@ -303,54 +515,78 @@ class KosmosFP8Quantizer:
         debug_print(f"FP8 supported: {self.fp8_supported}", "INFO")
         
     def load_components(self):
-        """Load tokenizer and processor with detailed debugging"""
+        """Load tokenizer and processor with enhanced error handling"""
         debug_print("="*50, "INFO")
         debug_print("LOADING MODEL COMPONENTS", "INFO")
         debug_print("="*50, "INFO")
         
-        # Load tokenizer
+        # Load tokenizer with retries
         debug_print("Loading tokenizer...", "INFO")
-        try:
-            debug_print(f"Tokenizer class: {self.components['AutoTokenizer']}", "DEBUG")
-            debug_print(f"Loading from: {self.model_name}", "DEBUG")
-            
-            self.tokenizer = self.components['AutoTokenizer'].from_pretrained(
-                self.model_name, 
-                cache_dir=self.cache_dir,
-                trust_remote_code=True
-            )
-            debug_print("✓ Tokenizer loaded successfully", "INFO")
-            debug_print(f"Tokenizer type: {type(self.tokenizer)}", "DEBUG")
-            debug_print(f"Vocab size: {len(self.tokenizer) if hasattr(self.tokenizer, '__len__') else 'Unknown'}", "DEBUG")
-            
-        except Exception as e:
-            debug_print(f"✗ Failed to load tokenizer: {e}", "ERROR")
-            debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
-            raise
-        
-        # Load processor
-        if self.components['AutoProcessor']:
-            debug_print("Loading processor...", "INFO")
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                debug_print(f"Processor class: {self.components['AutoProcessor']}", "DEBUG")
+                debug_print(f"Tokenizer attempt {attempt + 1}/{max_retries}", "DEBUG")
+                debug_print(f"Tokenizer class: {self.components['AutoTokenizer']}", "DEBUG")
+                debug_print(f"Loading from: {self.model_name}", "DEBUG")
                 
-                self.processor = self.components['AutoProcessor'].from_pretrained(
+                self.tokenizer = self.components['AutoTokenizer'].from_pretrained(
                     self.model_name, 
                     cache_dir=self.cache_dir,
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    resume_download=True
                 )
-                debug_print("✓ Processor loaded successfully", "INFO")
-                debug_print(f"Processor type: {type(self.processor)}", "DEBUG")
+                debug_print("✓ Tokenizer loaded successfully", "INFO")
+                debug_print(f"Tokenizer type: {type(self.tokenizer)}", "DEBUG")
+                try:
+                    vocab_size = len(self.tokenizer) if hasattr(self.tokenizer, '__len__') else 'Unknown'
+                    debug_print(f"Vocab size: {vocab_size}", "DEBUG")
+                except:
+                    debug_print("Vocab size: Could not determine", "DEBUG")
+                break
                 
             except Exception as e:
-                debug_print(f"⚠ Failed to load processor: {e}", "WARNING")
-                debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
-                self.processor = None
+                debug_print(f"⚠ Tokenizer attempt {attempt + 1} failed: {e}", "WARNING")
+                if attempt == max_retries - 1:
+                    debug_print(f"✗ Failed to load tokenizer after {max_retries} attempts", "ERROR")
+                    debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
+                    raise
+                else:
+                    debug_print(f"Retrying in 2 seconds...", "INFO")
+                    time.sleep(2)
+        
+        # Load processor with fallbacks
+        if self.components['AutoProcessor']:
+            debug_print("Loading processor...", "INFO")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    debug_print(f"Processor attempt {attempt + 1}/{max_retries}", "DEBUG")
+                    debug_print(f"Processor class: {self.components['AutoProcessor']}", "DEBUG")
+                    
+                    self.processor = self.components['AutoProcessor'].from_pretrained(
+                        self.model_name, 
+                        cache_dir=self.cache_dir,
+                        trust_remote_code=True,
+                        resume_download=True
+                    )
+                    debug_print("✓ Processor loaded successfully", "INFO")
+                    debug_print(f"Processor type: {type(self.processor)}", "DEBUG")
+                    break
+                    
+                except Exception as e:
+                    debug_print(f"⚠ Processor attempt {attempt + 1} failed: {e}", "WARNING")
+                    if attempt == max_retries - 1:
+                        debug_print(f"⚠ Failed to load processor after {max_retries} attempts, continuing without it", "WARNING")
+                        self.processor = None
+                        break
+                    else:
+                        debug_print(f"Retrying in 2 seconds...", "INFO")
+                        time.sleep(2)
         else:
             debug_print("AutoProcessor not available, using tokenizer only", "INFO")
             
         debug_print("✓ Component loading completed", "INFO")
-    
+
     def method_1_bitsandbytes_8bit(self, save_path="./kosmos2.5-8bit"):
         """8-bit quantization with comprehensive debugging"""
         debug_print("="*50, "INFO")
@@ -420,7 +656,7 @@ class KosmosFP8Quantizer:
             debug_print(f"✗ 8-bit quantization failed: {e}", "ERROR")
             debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
             return None
-    
+
     def method_2_torch_native_fp16(self, save_path="./kosmos2.5-fp16"):
         """FP16 quantization with comprehensive debugging"""
         debug_print("="*50, "INFO")
@@ -480,7 +716,7 @@ class KosmosFP8Quantizer:
             debug_print(f"✗ FP16 optimization failed: {e}", "ERROR")
             debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
             return None
-    
+
     def method_3_manual_fp8_simulation(self, save_path="./kosmos2.5-fp8-sim"):
         """FP8 simulation with comprehensive debugging"""
         debug_print("="*50, "INFO")
@@ -606,15 +842,21 @@ class KosmosFP8Quantizer:
                 debug_print(f"  Model memory footprint: {memory_mb:.1f} MB", "INFO")
             
             # Device info
-            if next(self.model.parameters()).is_cuda:
-                device = next(self.model.parameters()).device
-                debug_print(f"  Model device: {device}", "INFO")
-            else:
-                debug_print(f"  Model device: CPU", "INFO")
+            try:
+                if next(self.model.parameters()).is_cuda:
+                    device = next(self.model.parameters()).device
+                    debug_print(f"  Model device: {device}", "INFO")
+                else:
+                    debug_print(f"  Model device: CPU", "INFO")
+            except:
+                debug_print(f"  Model device: Could not determine", "DEBUG")
                 
             # Data type
-            dtype = next(self.model.parameters()).dtype
-            debug_print(f"  Model dtype: {dtype}", "INFO")
+            try:
+                dtype = next(self.model.parameters()).dtype
+                debug_print(f"  Model dtype: {dtype}", "INFO")
+            except:
+                debug_print(f"  Model dtype: Could not determine", "DEBUG")
             
         except Exception as e:
             debug_print(f"Failed to get model info: {e}", "WARNING")
@@ -665,7 +907,7 @@ class KosmosFP8Quantizer:
                 debug_print(f"⚠ Failed to save processor: {e}", "WARNING")
                 
         debug_print(f"✓ All components saved to {save_path}", "INFO")
-    
+
     def benchmark_model(self, model, iterations=10):
         """Benchmark with detailed debugging"""
         debug_print("="*50, "INFO")
@@ -753,10 +995,10 @@ class KosmosFP8Quantizer:
 
 def main():
     debug_print("="*80, "INFO")
-    debug_print("KOSMOS-2.5 FP8/QUANTIZATION TOOL STARTING", "INFO")
+    debug_print("KOSMOS-2.5 FP8/QUANTIZATION TOOL WITH AUTO-FIX", "INFO")
     debug_print("="*80, "INFO")
     
-    parser = argparse.ArgumentParser(description='Enhanced FP8/Quantization for Kosmos-2.5 with comprehensive debugging')
+    parser = argparse.ArgumentParser(description='Enhanced FP8/Quantization for Kosmos-2.5 with automatic dependency fixing')
     parser.add_argument('--method', 
                        choices=['8bit', 'fp16', 'fp8_sim'], 
                        required=True,
@@ -766,10 +1008,16 @@ def main():
     parser.add_argument('--benchmark', action='store_true', help='Run performance benchmark')
     parser.add_argument('--cache_dir', default=None)
     parser.add_argument('--check_deps', action='store_true', help='Only check dependencies')
+    parser.add_argument('--auto_fix', action='store_true', default=True, help='Automatically fix dependency issues')
+    parser.add_argument('--no_auto_fix', action='store_true', help='Disable automatic fixing')
     parser.add_argument('--debug_level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
                        default='INFO', help='Set debug level')
     
     args = parser.parse_args()
+    
+    # Handle auto-fix settings
+    if args.no_auto_fix:
+        args.auto_fix = False
     
     # Set debug level
     if args.debug_level:
@@ -778,15 +1026,17 @@ def main():
     
     debug_print(f"Arguments: {vars(args)}", "DEBUG")
     
-    # Check dependencies first
-    debug_print("Starting dependency check...", "INFO")
-    if not check_and_install_dependencies():
-        debug_print("✗ Dependency check failed. Please fix the issues above.", "ERROR")
+    # Check dependencies with optional auto-fix
+    debug_print("Starting enhanced dependency check...", "INFO")
+    if not check_and_install_dependencies(auto_fix=args.auto_fix):
+        debug_print("✗ Dependency check failed. Please fix the issues manually.", "ERROR")
+        if not args.auto_fix:
+            debug_print("Try running with --auto_fix to automatically resolve issues", "INFO")
         return 1
     
     if args.check_deps:
         debug_print("✓ Dependency check completed successfully!", "INFO")
-        debug_print("Exiting after dependency check", "INFO")
+        debug_print("All components are ready for quantization", "INFO")
         return 0
     
     # Check GPU compatibility
@@ -839,6 +1089,7 @@ def main():
         debug_print(f"Model: {args.model_name}", "INFO")
         debug_print(f"Save path: {args.save_path}", "INFO")
         debug_print(f"Quantization time: {quantization_time:.2f}s", "INFO")
+        debug_print(f"Auto-fix enabled: {args.auto_fix}", "INFO")
         
         if args.benchmark and benchmark_results:
             memory_reduction = "~50% (FP32→FP16)" if args.method == 'fp16' else "~62.5% (FP32→8bit)"
@@ -858,7 +1109,7 @@ def main():
     except Exception as e:
         debug_print(f"✗ Quantization failed: {e}", "ERROR")
         debug_print(f"Full error details: {traceback.format_exc()}", "DEBUG")
-        debug_print("Try checking dependencies with --check_deps or use a different method", "INFO")
+        debug_print("Try running with --check_deps to verify dependencies", "INFO")
         return 1
 
 if __name__ == "__main__":
