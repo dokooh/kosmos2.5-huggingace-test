@@ -5,6 +5,7 @@ Optimized Markdown Generation Inference Module for Kosmos-2.5 with SafeTensors
 This module provides fast markdown generation using optimized Kosmos-2.5 model.
 Features:
 - SafeTensors format for faster loading
+- Support for local SafeTensor model paths
 - bfloat16/float16 quantization for optimal performance
 - Optimized memory usage
 - Enhanced markdown post-processing
@@ -27,12 +28,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OptimizedMarkdownInference:
-    def __init__(self, model_name="microsoft/kosmos-2.5", device=None, cache_dir=None):
+    def __init__(self, model_name="microsoft/kosmos-2.5", device=None, cache_dir=None, local_model_path=None):
+        """
+        Initialize Markdown inference with support for local SafeTensor models
+        
+        Args:
+            model_name (str): HuggingFace model name or local path
+            device (str): Device to use for inference
+            cache_dir (str): Cache directory for downloaded models
+            local_model_path (str): Path to local SafeTensor model directory
+        """
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.cache_dir = cache_dir
+        self.local_model_path = local_model_path
         self.model = None
         self.processor = None
+        
+        # Determine the actual model path to use
+        self.effective_model_path = self._determine_model_path()
         
         # Use bfloat16 for better performance on modern hardware, fallback to float16
         if self.device.startswith('cuda') and torch.cuda.is_bf16_supported():
@@ -46,6 +60,39 @@ class OptimizedMarkdownInference:
             logger.info("Using float32 for CPU")
         
         logger.info(f"Initializing Markdown inference on {self.device} with {self.dtype}")
+        logger.info(f"Model path: {self.effective_model_path}")
+    
+    def _determine_model_path(self):
+        """Determine which model path to use based on parameters"""
+        if self.local_model_path:
+            if os.path.exists(self.local_model_path):
+                logger.info(f"Using local SafeTensor model from: {self.local_model_path}")
+                return self.local_model_path
+            else:
+                logger.warning(f"Local model path does not exist: {self.local_model_path}")
+                logger.info(f"Falling back to: {self.model_name}")
+                return self.model_name
+        else:
+            return self.model_name
+    
+    def _validate_safetensor_model(self, model_path):
+        """Validate that the model path contains SafeTensor files"""
+        if not os.path.isdir(model_path):
+            return False
+        
+        # Check for SafeTensor files
+        safetensor_files = [f for f in os.listdir(model_path) if f.endswith('.safetensors')]
+        config_files = [f for f in os.listdir(model_path) if f in ['config.json', 'model.safetensors.index.json']]
+        
+        has_safetensors = len(safetensor_files) > 0
+        has_config = len(config_files) > 0
+        
+        if has_safetensors and has_config:
+            logger.info(f"Found {len(safetensor_files)} SafeTensor files in {model_path}")
+            return True
+        else:
+            logger.warning(f"Model path missing required files. SafeTensors: {has_safetensors}, Config: {has_config}")
+            return False
     
     def load_model(self):
         """Load model with SafeTensors and optimized parameters for faster loading"""
@@ -53,20 +100,50 @@ class OptimizedMarkdownInference:
             return
             
         logger.info("Loading optimized Kosmos-2.5 model with SafeTensors...")
+        
+        # Validate local model if specified
+        is_local_model = os.path.exists(self.effective_model_path)
+        if is_local_model:
+            if not self._validate_safetensor_model(self.effective_model_path):
+                logger.error(f"Invalid SafeTensor model directory: {self.effective_model_path}")
+                raise ValueError("Local model path does not contain valid SafeTensor files")
+        
         try:
-            # Add these parameters for faster model loading and better performance
+            # Configure loading parameters based on whether it's local or remote
+            loading_kwargs = {
+                "torch_dtype": self.dtype,
+                "cache_dir": self.cache_dir,
+                "trust_remote_code": True,
+            }
+            
+            if is_local_model:
+                # For local SafeTensor models
+                loading_kwargs.update({
+                    "local_files_only": True,        # Only use local files
+                    "use_safetensors": True,         # Explicitly use SafeTensors
+                    "low_cpu_mem_usage": True,       # Optimize memory usage
+                    "device_map": "auto",            # Automatic device placement
+                })
+                logger.info("Loading from local SafeTensor files...")
+            else:
+                # For remote models with optimizations
+                loading_kwargs.update({
+                    "low_cpu_mem_usage": True,       # Reduces CPU memory during loading
+                    "use_safetensors": True,         # Prefer SafeTensors format
+                    "device_map": "auto",            # Automatic device placement
+                    "local_files_only": False,       # Allow downloading if not local
+                    "resume_download": True,         # Resume interrupted downloads
+                })
+                logger.info("Loading from HuggingFace Hub with SafeTensors preference...")
+            
+            # Add Flash Attention if available
+            if hasattr(torch.nn, 'scaled_dot_product_attention'):
+                loading_kwargs["attn_implementation"] = "flash_attention_2"
+            
+            # Load the model
             self.model = AutoModelForImageTextToText.from_pretrained(
-                self.model_name,
-                low_cpu_mem_usage=True,          # Reduces CPU memory during loading
-                use_safetensors=True,            # Faster file format
-                device_map="auto",               # Automatic device placement
-                torch_dtype=self.dtype,          # Often faster than float16
-                cache_dir=self.cache_dir,
-                trust_remote_code=True,
-                local_files_only=False,          # Allow downloading if not local
-                resume_download=True,            # Resume interrupted downloads
-                # Additional optimizations
-                attn_implementation="flash_attention_2" if hasattr(torch.nn, 'scaled_dot_product_attention') else None,
+                self.effective_model_path,
+                **loading_kwargs
             )
             
             # Ensure model is in the correct dtype
@@ -77,13 +154,23 @@ class OptimizedMarkdownInference:
                     self.model = self.model.half()
                     
             # Load processor with optimizations
+            processor_kwargs = {
+                "cache_dir": self.cache_dir,
+                "trust_remote_code": True,
+                "use_fast": True,  # Use fast tokenizer when available
+            }
+            
+            if is_local_model:
+                processor_kwargs["local_files_only"] = True
+            else:
+                processor_kwargs.update({
+                    "local_files_only": False,
+                    "resume_download": True
+                })
+            
             self.processor = AutoProcessor.from_pretrained(
-                self.model_name,
-                cache_dir=self.cache_dir,
-                trust_remote_code=True,
-                use_fast=True,                   # Use fast tokenizer when available
-                local_files_only=False,
-                resume_download=True
+                self.effective_model_path,
+                **processor_kwargs
             )
             
             # Set pad token if not present
@@ -106,29 +193,46 @@ class OptimizedMarkdownInference:
             logger.info("Model loaded successfully with optimizations")
             
             # Print model info
-            if hasattr(self.model, 'num_parameters'):
-                try:
-                    num_params = sum(p.numel() for p in self.model.parameters())
-                    logger.info(f"Model parameters: {num_params:,}")
-                except:
-                    pass
+            try:
+                num_params = sum(p.numel() for p in self.model.parameters())
+                logger.info(f"Model parameters: {num_params:,}")
+                
+                if torch.cuda.is_available():
+                    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                    logger.info(f"GPU memory available: {gpu_memory:.1f} GB")
+            except:
+                pass
             
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             # Fallback to basic loading
             logger.info("Attempting fallback model loading...")
             try:
+                fallback_kwargs = {
+                    "torch_dtype": self.dtype,
+                    "cache_dir": self.cache_dir,
+                    "trust_remote_code": True
+                }
+                
+                if is_local_model:
+                    fallback_kwargs["local_files_only"] = True
+                
                 self.model = AutoModelForImageTextToText.from_pretrained(
-                    self.model_name,
-                    torch_dtype=self.dtype,
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=True
+                    self.effective_model_path,
+                    **fallback_kwargs
                 )
                 
+                processor_fallback_kwargs = {
+                    "cache_dir": self.cache_dir,
+                    "trust_remote_code": True
+                }
+                
+                if is_local_model:
+                    processor_fallback_kwargs["local_files_only"] = True
+                
                 self.processor = AutoProcessor.from_pretrained(
-                    self.model_name,
-                    cache_dir=self.cache_dir,
-                    trust_remote_code=True
+                    self.effective_model_path,
+                    **processor_fallback_kwargs
                 )
                 
                 if self.processor.tokenizer.pad_token is None:
@@ -366,6 +470,10 @@ def get_args():
                        help='Sampling temperature (0 for deterministic)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
+    parser.add_argument('--local_model_path', type=str, default=None,
+                       help='Path to local SafeTensor model directory')
+    parser.add_argument('--model_name', type=str, default='microsoft/kosmos-2.5',
+                       help='HuggingFace model name (used if local_model_path not provided)')
     parser.add_argument('--batch', action='store_true',
                        help='Process multiple images (image should be a directory)')
     parser.add_argument('--print_output', '-p', action='store_true',
@@ -378,8 +486,10 @@ def main():
     
     # Initialize markdown inference
     md_engine = OptimizedMarkdownInference(
+        model_name=args.model_name,
         device=args.device,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
+        local_model_path=args.local_model_path
     )
     
     try:
