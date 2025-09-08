@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-FP8 Quantization for Kosmos-2.5 - Simplified Version with PyTorch/Transformers Fix
+FP8 Quantization for Kosmos-2.5 - Simplified Version with Comprehensive Fixes
 
 This script implements FP8 quantization for Kosmos-2.5 without dependency management.
-Handles PyTorch/Transformers version compatibility issues and tokenizer loading issues.
+Handles multiple compatibility issues including PyTorch/Transformers, NumPy, and import errors.
 
 Requirements:
 - PyTorch >= 2.1.0 with CUDA support
@@ -19,6 +19,7 @@ import traceback
 import warnings
 import json
 import shutil
+import subprocess
 
 # Suppress NumPy and other warnings that might interfere
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
@@ -100,6 +101,36 @@ def apply_numpy_workaround():
         debug_print(f"⚠ NumPy workaround failed: {e}", "WARNING")
         return False
 
+def fix_transformers_installation():
+    """Fix corrupted transformers installation"""
+    debug_print("Attempting to fix transformers installation...", "INFO")
+    
+    try:
+        # Try to reinstall transformers with specific version
+        debug_print("Attempting to reinstall transformers...", "WARNING")
+        
+        # Use subprocess to avoid import conflicts
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "transformers==4.35.2", "--no-deps"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            debug_print("✓ Transformers reinstalled successfully", "INFO")
+            
+            # Clear module cache
+            modules_to_clear = [mod for mod in sys.modules.keys() if 'transformers' in mod.lower()]
+            for mod in modules_to_clear:
+                if mod in sys.modules:
+                    del sys.modules[mod]
+            
+            return True
+        else:
+            debug_print(f"⚠ Transformers reinstall failed: {result.stderr}", "WARNING")
+            return False
+            
+    except Exception as e:
+        debug_print(f"⚠ Transformers fix failed: {e}", "WARNING")
+        return False
+
 def safe_import_transformers():
     """Safely import transformers with comprehensive compatibility fixes"""
     debug_print("Attempting to import transformers with comprehensive fixes...", "INFO")
@@ -113,23 +144,31 @@ def safe_import_transformers():
         import transformers
         debug_print(f"✓ Transformers imported directly: {transformers.__version__}", "INFO")
         return transformers
-    except AttributeError as e:
-        if "register_pytree_node" in str(e):
+    except ImportError as e:
+        if "GenerationMixin" in str(e):
+            debug_print("⚠ GenerationMixin import error detected, trying installation fix...", "WARNING")
+        elif "register_pytree_node" in str(e):
             debug_print("⚠ PyTorch/Transformers compatibility issue detected, trying advanced fix...", "WARNING")
-        else:
-            debug_print(f"✗ Transformers import failed with AttributeError: {e}", "ERROR")
-            raise
-    except ValueError as e:
-        if "numpy.dtype size changed" in str(e):
+        elif "numpy.dtype size changed" in str(e):
             debug_print("⚠ NumPy compatibility issue detected, trying sklearn blocking...", "WARNING")
         else:
-            debug_print(f"✗ Transformers import failed with ValueError: {e}", "ERROR")
-            raise
+            debug_print(f"✗ Transformers import failed with ImportError: {e}", "ERROR")
     except Exception as e:
         debug_print(f"✗ Transformers import failed: {e}", "ERROR")
-        raise
     
-    # Strategy 2: Advanced PyTorch compatibility fix
+    # Strategy 2: Fix installation and retry
+    try:
+        debug_print("Attempting installation fix and retry...", "INFO")
+        
+        if fix_transformers_installation():
+            import transformers
+            debug_print(f"✓ Transformers imported after installation fix: {transformers.__version__}", "INFO")
+            return transformers
+        
+    except Exception as e:
+        debug_print(f"✗ Installation fix failed: {e}", "ERROR")
+    
+    # Strategy 3: Advanced PyTorch compatibility fix
     try:
         debug_print("Attempting advanced PyTorch compatibility fix...", "INFO")
         
@@ -159,7 +198,7 @@ def safe_import_transformers():
     except Exception as e:
         debug_print(f"✗ Advanced PyTorch fix failed: {e}", "ERROR")
     
-    # Strategy 3: sklearn blocking + PyTorch fix
+    # Strategy 4: sklearn blocking + PyTorch fix
     try:
         debug_print("Attempting sklearn blocking with PyTorch fix...", "INFO")
         
@@ -191,7 +230,29 @@ def safe_import_transformers():
     except Exception as e:
         debug_print(f"✗ Sklearn blocking strategy failed: {e}", "ERROR")
     
-    # Strategy 4: Last resort - minimal import
+    # Strategy 5: Install compatible transformers version
+    try:
+        debug_print("Trying to install compatible transformers version...", "INFO")
+        
+        # Try installing an older, more stable version
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "transformers==4.34.1", "--no-deps"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            # Clear module cache
+            modules_to_clear = [mod for mod in sys.modules.keys() if 'transformers' in mod.lower()]
+            for mod in modules_to_clear:
+                if mod in sys.modules:
+                    del sys.modules[mod]
+            
+            import transformers
+            debug_print(f"✓ Compatible transformers version imported: {transformers.__version__}", "INFO")
+            return transformers
+        
+    except Exception as e:
+        debug_print(f"✗ Compatible version strategy failed: {e}", "ERROR")
+    
+    # Strategy 6: Last resort - minimal import
     try:
         debug_print("Trying minimal transformers import as last resort...", "INFO")
         
@@ -204,7 +265,7 @@ def safe_import_transformers():
         # Try importing just the core components we need
         import transformers.configuration_utils
         import transformers.modeling_utils
-        import transformers.tokenization_utils
+        import transformers.tokenization_utils_base
         
         import transformers
         debug_print(f"✓ Minimal transformers imported: {transformers.__version__}", "INFO")
@@ -296,8 +357,11 @@ class SimpleKosmosQuantizer:
             
             # Pre-import the components we'll need to avoid later import issues
             debug_print("Pre-importing transformers components...", "INFO")
-            from transformers import AutoTokenizer
-            debug_print("✓ AutoTokenizer pre-imported", "INFO")
+            try:
+                from transformers import AutoTokenizer
+                debug_print("✓ AutoTokenizer pre-imported", "INFO")
+            except ImportError as e:
+                debug_print(f"⚠ AutoTokenizer pre-import failed: {e}", "WARNING")
             
             try:
                 from transformers import AutoProcessor
@@ -354,8 +418,6 @@ class SimpleKosmosQuantizer:
                         
                         # Strategy 4: Minimal tokenizer loading
                         try:
-                            from transformers import PreTrainedTokenizerFast, GPT2TokenizerFast
-                            
                             # Try fallback tokenizers
                             fallback_tokenizers = [
                                 "microsoft/DialoGPT-medium",
@@ -400,10 +462,10 @@ class SimpleKosmosQuantizer:
     def get_model_class(self):
         """Get the appropriate model class"""
         model_classes = [
+            'AutoModelForCausalLM',  # Try this first as it's most likely to work
             'Kosmos2_5ForConditionalGeneration',
             'AutoModelForImageTextToText',
-            'AutoModelForVision2Seq',
-            'AutoModelForCausalLM'
+            'AutoModelForVision2Seq'
         ]
         
         for class_name in model_classes:
@@ -424,8 +486,8 @@ class SimpleKosmosQuantizer:
                 debug_print(f"✓ Using model class: {class_name}", "INFO")
                 return model_class
                 
-            except ImportError:
-                debug_print(f"⚠ {class_name} not available, trying next...", "WARNING")
+            except ImportError as e:
+                debug_print(f"⚠ {class_name} not available: {e}, trying next...", "WARNING")
                 continue
         
         raise ImportError("No suitable model class found")
@@ -585,8 +647,16 @@ def main():
     parser.add_argument('--clear_cache', 
                        action='store_true',
                        help='Clear model cache before loading')
+    parser.add_argument('--fix_install', 
+                       action='store_true',
+                       help='Attempt to fix transformers installation')
     
     args = parser.parse_args()
+    
+    # Fix installation if requested
+    if args.fix_install:
+        debug_print("Attempting to fix transformers installation as requested...", "INFO")
+        fix_transformers_installation()
     
     # Clear cache if requested
     if args.clear_cache:
