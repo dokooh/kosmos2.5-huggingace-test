@@ -27,9 +27,39 @@ def debug_print(message, level="INFO"):
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
+def apply_numpy_workaround():
+    """Apply NumPy compatibility workaround before any imports"""
+    debug_print("Applying NumPy compatibility workaround...", "INFO")
+    
+    try:
+        # Clear any existing problematic modules from cache
+        modules_to_clear = [mod for mod in sys.modules.keys() 
+                           if any(keyword in mod.lower() for keyword in ['sklearn', 'scipy', 'numpy', 'transformers'])]
+        for mod in modules_to_clear:
+            if mod in sys.modules:
+                del sys.modules[mod]
+                debug_print(f"Cleared module: {mod}", "DEBUG")
+        
+        # Set environment variables to ignore NumPy API warnings
+        os.environ['NUMPY_DISABLE_API_COMPATIBILITY_WARNING'] = '1'
+        os.environ['SKLEARN_ALLOW_DEPRECATED_SKLEARN_PACKAGE_INSTALL'] = 'True'
+        
+        # Try to import and fix NumPy first
+        import numpy as np
+        debug_print(f"✓ NumPy imported with workaround: {np.__version__}", "INFO")
+        
+        return True
+        
+    except Exception as e:
+        debug_print(f"⚠ NumPy workaround failed: {e}", "WARNING")
+        return False
+
 def safe_import_transformers():
     """Safely import transformers with NumPy compatibility workaround"""
     debug_print("Attempting to import transformers with NumPy workaround...", "INFO")
+    
+    # Apply workaround first
+    apply_numpy_workaround()
     
     # Strategy 1: Try direct import
     try:
@@ -38,41 +68,62 @@ def safe_import_transformers():
         return transformers
     except ValueError as e:
         if "numpy.dtype size changed" in str(e):
-            debug_print("⚠ NumPy compatibility issue detected, trying workaround...", "WARNING")
+            debug_print("⚠ NumPy compatibility issue detected, trying advanced workaround...", "WARNING")
         else:
             debug_print(f"✗ Transformers import failed: {e}", "ERROR")
             raise
     
-    # Strategy 2: Clear modules and set environment variables
+    # Strategy 2: Advanced workaround - monkey patch sklearn import
     try:
-        # Clear problematic modules from cache
-        modules_to_clear = [mod for mod in sys.modules.keys() 
-                           if any(keyword in mod.lower() for keyword in ['sklearn', 'scipy', 'numpy'])]
-        for mod in modules_to_clear:
-            if mod in sys.modules:
-                del sys.modules[mod]
+        debug_print("Attempting advanced NumPy compatibility fix...", "INFO")
         
-        # Set environment variable to ignore NumPy API version
-        os.environ['NUMPY_DISABLE_API_COMPATIBILITY_WARNING'] = '1'
+        # Temporarily disable sklearn import in transformers
+        original_import = __builtins__.__import__
         
-        # Try importing numpy first
-        import numpy as np
-        debug_print(f"✓ NumPy imported with workaround: {np.__version__}", "INFO")
+        def patched_import(name, *args, **kwargs):
+            if 'sklearn' in name or 'scikit-learn' in name:
+                debug_print(f"Blocking sklearn import: {name}", "DEBUG")
+                raise ImportError(f"Blocked sklearn import: {name}")
+            return original_import(name, *args, **kwargs)
         
-        # Now try transformers again
-        import transformers
-        debug_print(f"✓ Transformers imported with workaround: {transformers.__version__}", "INFO")
-        return transformers
+        # Apply patch temporarily
+        __builtins__.__import__ = patched_import
         
+        try:
+            import transformers
+            debug_print(f"✓ Transformers imported with sklearn blocking: {transformers.__version__}", "INFO")
+            return transformers
+        finally:
+            # Restore original import
+            __builtins__.__import__ = original_import
+            
     except Exception as e:
-        debug_print(f"✗ Workaround failed: {e}", "ERROR")
-        raise
+        debug_print(f"✗ Advanced workaround failed: {e}", "ERROR")
+        
+        # Strategy 3: Last resort - try with minimal transformers
+        try:
+            debug_print("Trying minimal transformers import...", "INFO")
+            
+            # Import only what we need
+            import transformers.models.auto.tokenization_auto
+            import transformers.models.auto.modeling_auto
+            
+            import transformers
+            debug_print(f"✓ Minimal transformers imported: {transformers.__version__}", "INFO")
+            return transformers
+            
+        except Exception as e2:
+            debug_print(f"✗ All import strategies failed: {e2}", "ERROR")
+            raise
 
 class SimpleKosmosQuantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
         debug_print(f"Initializing SimpleKosmosQuantizer...", "INFO")
         self.model_name = model_name
         self.cache_dir = cache_dir
+        
+        # Apply NumPy workaround first
+        apply_numpy_workaround()
         
         # Import required libraries
         try:
@@ -87,6 +138,12 @@ class SimpleKosmosQuantizer:
         # Import transformers with workaround
         try:
             self.transformers = safe_import_transformers()
+            
+            # Pre-import the components we'll need to avoid later import issues
+            debug_print("Pre-importing transformers components...", "INFO")
+            from transformers import AutoTokenizer, AutoProcessor
+            debug_print("✓ Transformers components pre-imported", "INFO")
+            
         except Exception as e:
             debug_print(f"✗ Transformers import failed: {e}", "ERROR")
             raise ImportError("Transformers not available")
@@ -96,6 +153,7 @@ class SimpleKosmosQuantizer:
         debug_print("Loading tokenizer and processor...", "INFO")
         
         try:
+            # Since we pre-imported, this should work now
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
@@ -284,6 +342,9 @@ def main():
     debug_print("="*80, "INFO")
     debug_print("KOSMOS-2.5 QUANTIZATION TOOL", "INFO")
     debug_print("="*80, "INFO")
+    
+    # Apply NumPy workaround at the very beginning
+    apply_numpy_workaround()
     
     parser = argparse.ArgumentParser(description='Kosmos-2.5 Quantization Tool')
     parser.add_argument('--method', 
