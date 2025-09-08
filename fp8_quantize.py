@@ -9,6 +9,7 @@ This script implements multiple FP8 quantization approaches with robust dependen
 4. Alternative import strategies
 5. Comprehensive debugging output
 6. Triton library conflict resolution
+7. ML_dtypes and ONNX compatibility fixes
 
 Requirements (Auto-detected and fixed):
 - GPU with Compute Capability >= 8.0 (recommended >= 8.9)
@@ -94,6 +95,42 @@ def run_command(command, description=""):
     except Exception as e:
         debug_print(f"✗ Command execution failed: {e}", "ERROR")
         return False, str(e)
+
+def fix_ml_dtypes_onnx_conflict():
+    """Fix ML_dtypes and ONNX compatibility issues"""
+    debug_print("="*60, "INFO")
+    debug_print("FIXING ML_DTYPES AND ONNX COMPATIBILITY ISSUES", "INFO")
+    debug_print("="*60, "INFO")
+    
+    # Strategy 1: Uninstall problematic packages
+    debug_print("Uninstalling problematic packages...", "INFO")
+    uninstall_commands = [
+        "pip uninstall onnx-ir onnxscript ml-dtypes -y",
+        "pip uninstall onnx onnxruntime -y",
+    ]
+    
+    for cmd in uninstall_commands:
+        success, _ = run_command(cmd, f"Cleanup: {cmd}")
+        if not success:
+            debug_print(f"⚠ Command failed but continuing: {cmd}", "WARNING")
+    
+    # Strategy 2: Install compatible versions
+    debug_print("Installing compatible package versions...", "INFO")
+    
+    # Install compatible ml_dtypes first
+    success, _ = run_command("pip install 'ml-dtypes>=0.2.0,<0.4.0'", "Install compatible ml_dtypes")
+    if not success:
+        debug_print("⚠ Failed to install ml_dtypes, trying alternative...", "WARNING")
+        success, _ = run_command("pip install ml-dtypes==0.3.2", "Install specific ml_dtypes")
+    
+    # Install ONNX without the problematic ir package
+    success, _ = run_command("pip install 'onnx>=1.14.0,<1.16.0'", "Install compatible ONNX")
+    if not success:
+        debug_print("⚠ Failed to install ONNX", "WARNING")
+    
+    # Avoid onnxscript and onnx-ir for now
+    debug_print("✓ ML_dtypes compatibility fix attempted", "INFO")
+    return True
 
 def detect_cuda_version():
     """Detect available CUDA version on the system"""
@@ -278,10 +315,72 @@ def safe_import_torch():
     
     return None
 
+def safe_import_torchvision():
+    """Safely import torchvision with ML_dtypes conflict resolution"""
+    debug_print("Attempting safe torchvision import...", "INFO")
+    
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        debug_print(f"Torchvision import attempt {attempt + 1}/{max_attempts}", "DEBUG")
+        
+        try:
+            # Clear torchvision from cache
+            modules_to_clear = [mod for mod in sys.modules.keys() if 'torchvision' in mod or 'onnx' in mod]
+            for mod in modules_to_clear:
+                if mod in sys.modules:
+                    del sys.modules[mod]
+                    debug_print(f"Cleared module: {mod}", "DEBUG")
+            
+            import torchvision
+            debug_print(f"✓ Torchvision imported successfully: {torchvision.__version__}", "INFO")
+            return torchvision
+            
+        except AttributeError as e:
+            if "ml_dtypes" in str(e) and "float8_e8m0fnu" in str(e):
+                debug_print(f"⚠ ML_dtypes compatibility issue detected on attempt {attempt + 1}: {e}", "WARNING")
+                
+                if attempt < max_attempts - 1:
+                    debug_print("Attempting ML_dtypes compatibility fix...", "INFO")
+                    if fix_ml_dtypes_onnx_conflict():
+                        debug_print("✓ ML_dtypes fix completed, retrying import...", "INFO")
+                        time.sleep(2)
+                        continue
+                    else:
+                        debug_print("✗ ML_dtypes fix failed", "ERROR")
+                else:
+                    debug_print("✗ All torchvision import attempts failed due to ML_dtypes conflicts", "ERROR")
+                    return None
+            else:
+                debug_print(f"✗ Torchvision import failed with different AttributeError: {e}", "ERROR")
+                return None
+                
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                debug_print(f"⚠ CUDA version mismatch detected: {e}", "WARNING")
+                if attempt < max_attempts - 1:
+                    debug_print("Attempting CUDA compatibility fix...", "INFO")
+                    if fix_triton_conflict():
+                        continue
+                return None
+            else:
+                debug_print(f"✗ Torchvision import failed with RuntimeError: {e}", "ERROR")
+                return None
+                
+        except ImportError as e:
+            debug_print(f"✗ Torchvision not found: {e}", "ERROR")
+            return None
+            
+        except Exception as e:
+            debug_print(f"✗ Unexpected error during torchvision import: {e}", "ERROR")
+            debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
+            return None
+    
+    return None
+
 def check_and_install_dependencies(auto_fix=True):
-    """Check and handle dependency issues with enhanced Triton conflict resolution"""
+    """Check and handle dependency issues with enhanced conflict resolution"""
     debug_print("="*60, "INFO")
-    debug_print("STARTING ENHANCED DEPENDENCY CHECK WITH TRITON FIXES", "INFO")
+    debug_print("STARTING ENHANCED DEPENDENCY CHECK WITH CONFLICT FIXES", "INFO")
     debug_print("="*60, "INFO")
     
     # Check PyTorch with Triton conflict handling
@@ -302,31 +401,15 @@ def check_and_install_dependencies(auto_fix=True):
         else:
             debug_print("⚠ Continuing without PyTorch - limited functionality", "WARNING")
     
-    # Check torchvision compatibility
+    # Check torchvision compatibility with ML_dtypes fix
     if pytorch_ok:
-        debug_print("Checking torchvision compatibility...", "INFO")
-        try:
-            import torchvision
+        debug_print("Checking torchvision compatibility with ML_dtypes fix...", "INFO")
+        torchvision = safe_import_torchvision()
+        if torchvision:
             debug_print(f"✓ Torchvision version: {torchvision.__version__}", "INFO")
             debug_print(f"✓ Torchvision location: {torchvision.__file__}", "DEBUG")
-            
-        except RuntimeError as e:
-            if "CUDA" in str(e):
-                debug_print(f"✗ CUDA version mismatch detected: {e}", "ERROR")
-                
-                if auto_fix:
-                    debug_print("Attempting automatic fix...", "INFO")
-                    if fix_triton_conflict():
-                        debug_print("✓ Fix attempt completed, please restart the script", "INFO")
-                        return False
-                    else:
-                        debug_print("✗ Automatic fix failed", "ERROR")
-                        return False
-            else:
-                debug_print(f"✗ Torchvision error: {e}", "ERROR")
-                
-        except ImportError as e:
-            debug_print(f"⚠ Torchvision not found: {e}", "WARNING")
+        else:
+            debug_print("⚠ Torchvision import failed, but continuing...", "WARNING")
     
     # Check transformers with enhanced error handling
     debug_print("Checking transformers library...", "INFO")
@@ -536,7 +619,7 @@ def check_fp8_compatibility():
         debug_print(f"Error details: {traceback.format_exc()}", "DEBUG")
         return False
 
-# Keep the existing KosmosFP8Quantizer class with enhanced error handling
+# Keep the existing KosmosFP8Quantizer class (same as before)
 class KosmosFP8Quantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
         debug_print(f"Initializing KosmosFP8Quantizer...", "INFO")
@@ -756,10 +839,10 @@ class KosmosFP8Quantizer:
 
 def main():
     debug_print("="*80, "INFO")
-    debug_print("KOSMOS-2.5 QUANTIZATION TOOL WITH TRITON CONFLICT RESOLUTION", "INFO")
+    debug_print("KOSMOS-2.5 QUANTIZATION TOOL WITH COMPREHENSIVE CONFLICT RESOLUTION", "INFO")
     debug_print("="*80, "INFO")
     
-    parser = argparse.ArgumentParser(description='Enhanced quantization with Triton conflict resolution')
+    parser = argparse.ArgumentParser(description='Enhanced quantization with comprehensive conflict resolution')
     parser.add_argument('--method', 
                        choices=['8bit', 'fp16'], 
                        required=True,
@@ -776,11 +859,11 @@ def main():
     if args.no_auto_fix:
         args.auto_fix = False
     
-    # Enhanced dependency check with Triton resolution
-    debug_print("Starting enhanced dependency check with Triton resolution...", "INFO")
+    # Enhanced dependency check with comprehensive conflict resolution
+    debug_print("Starting comprehensive dependency check with conflict resolution...", "INFO")
     if not check_and_install_dependencies(auto_fix=args.auto_fix):
         debug_print("✗ Dependency check failed.", "ERROR")
-        debug_print("Try running the script again or manually fix PyTorch installation", "INFO")
+        debug_print("Try running the script again or manually fix dependencies", "INFO")
         return 1
     
     if args.check_deps:
