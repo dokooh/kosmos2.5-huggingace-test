@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FP8 Quantization for Kosmos-2.5 - Simplified Version
+FP8 Quantization for Kosmos-2.5 - Simplified Version with NumPy Fix
 
 This script implements FP8 quantization for Kosmos-2.5 without dependency management.
 Assumes all required packages are already installed and compatible.
@@ -16,11 +16,57 @@ import os
 import time
 import argparse
 import traceback
+import warnings
+
+# Suppress NumPy warnings that might interfere
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 def debug_print(message, level="INFO"):
     """Simple debug printing"""
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] [{level}] {message}", flush=True)
+
+def safe_import_transformers():
+    """Safely import transformers with NumPy compatibility workaround"""
+    debug_print("Attempting to import transformers with NumPy workaround...", "INFO")
+    
+    # Strategy 1: Try direct import
+    try:
+        import transformers
+        debug_print(f"✓ Transformers imported directly: {transformers.__version__}", "INFO")
+        return transformers
+    except ValueError as e:
+        if "numpy.dtype size changed" in str(e):
+            debug_print("⚠ NumPy compatibility issue detected, trying workaround...", "WARNING")
+        else:
+            debug_print(f"✗ Transformers import failed: {e}", "ERROR")
+            raise
+    
+    # Strategy 2: Clear modules and set environment variables
+    try:
+        # Clear problematic modules from cache
+        modules_to_clear = [mod for mod in sys.modules.keys() 
+                           if any(keyword in mod.lower() for keyword in ['sklearn', 'scipy', 'numpy'])]
+        for mod in modules_to_clear:
+            if mod in sys.modules:
+                del sys.modules[mod]
+        
+        # Set environment variable to ignore NumPy API version
+        os.environ['NUMPY_DISABLE_API_COMPATIBILITY_WARNING'] = '1'
+        
+        # Try importing numpy first
+        import numpy as np
+        debug_print(f"✓ NumPy imported with workaround: {np.__version__}", "INFO")
+        
+        # Now try transformers again
+        import transformers
+        debug_print(f"✓ Transformers imported with workaround: {transformers.__version__}", "INFO")
+        return transformers
+        
+    except Exception as e:
+        debug_print(f"✗ Workaround failed: {e}", "ERROR")
+        raise
 
 class SimpleKosmosQuantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
@@ -38,11 +84,10 @@ class SimpleKosmosQuantizer:
             debug_print(f"✗ PyTorch import failed: {e}", "ERROR")
             raise ImportError("PyTorch not available")
         
+        # Import transformers with workaround
         try:
-            import transformers
-            self.transformers = transformers
-            debug_print(f"✓ Transformers {transformers.__version__} loaded", "INFO")
-        except ImportError as e:
+            self.transformers = safe_import_transformers()
+        except Exception as e:
             debug_print(f"✗ Transformers import failed: {e}", "ERROR")
             raise ImportError("Transformers not available")
     
