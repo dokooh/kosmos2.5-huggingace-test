@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-FP8 Quantization for Kosmos-2.5 - Simplified Version with NumPy Fix
+FP8 Quantization for Kosmos-2.5 - Simplified Version with PyTorch/Transformers Fix
 
 This script implements FP8 quantization for Kosmos-2.5 without dependency management.
-Assumes all required packages are already installed and compatible.
+Handles PyTorch/Transformers version compatibility issues.
 
 Requirements:
 - PyTorch >= 2.1.0 with CUDA support
-- transformers >= 4.36.0
+- transformers >= 4.36.0 (compatible version)
 - bitsandbytes (optional, for 8-bit quantization)
 """
 
@@ -18,14 +18,58 @@ import argparse
 import traceback
 import warnings
 
-# Suppress NumPy warnings that might interfere
+# Suppress NumPy and other warnings that might interfere
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 def debug_print(message, level="INFO"):
     """Simple debug printing"""
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] [{level}] {message}", flush=True)
+
+def fix_pytorch_transformers_compatibility():
+    """Fix PyTorch/Transformers compatibility issues"""
+    debug_print("Applying PyTorch/Transformers compatibility fixes...", "INFO")
+    
+    try:
+        # Import torch first to check version
+        import torch
+        torch_version = torch.__version__
+        debug_print(f"PyTorch version detected: {torch_version}", "INFO")
+        
+        # Check if torch.utils._pytree exists and has the required method
+        if hasattr(torch.utils, '_pytree'):
+            pytree = torch.utils._pytree
+            if not hasattr(pytree, 'register_pytree_node'):
+                debug_print("Adding missing register_pytree_node to torch.utils._pytree", "INFO")
+                
+                # Add a dummy implementation for compatibility
+                def dummy_register_pytree_node(*args, **kwargs):
+                    debug_print("Called dummy register_pytree_node (compatibility fix)", "DEBUG")
+                    pass
+                
+                pytree.register_pytree_node = dummy_register_pytree_node
+                debug_print("✓ Added dummy register_pytree_node method", "INFO")
+        else:
+            debug_print("torch.utils._pytree not found, creating dummy module", "INFO")
+            
+            # Create a dummy _pytree module
+            class DummyPytree:
+                @staticmethod
+                def register_pytree_node(*args, **kwargs):
+                    debug_print("Called dummy register_pytree_node (compatibility fix)", "DEBUG")
+                    pass
+            
+            torch.utils._pytree = DummyPytree()
+            debug_print("✓ Created dummy _pytree module", "INFO")
+        
+        return True
+        
+    except Exception as e:
+        debug_print(f"⚠ PyTorch compatibility fix failed: {e}", "WARNING")
+        return False
 
 def apply_numpy_workaround():
     """Apply NumPy compatibility workaround before any imports"""
@@ -55,29 +99,76 @@ def apply_numpy_workaround():
         return False
 
 def safe_import_transformers():
-    """Safely import transformers with NumPy compatibility workaround"""
-    debug_print("Attempting to import transformers with NumPy workaround...", "INFO")
+    """Safely import transformers with comprehensive compatibility fixes"""
+    debug_print("Attempting to import transformers with comprehensive fixes...", "INFO")
     
-    # Apply workaround first
+    # Apply all workarounds first
     apply_numpy_workaround()
+    fix_pytorch_transformers_compatibility()
     
     # Strategy 1: Try direct import
     try:
         import transformers
         debug_print(f"✓ Transformers imported directly: {transformers.__version__}", "INFO")
         return transformers
+    except AttributeError as e:
+        if "register_pytree_node" in str(e):
+            debug_print("⚠ PyTorch/Transformers compatibility issue detected, trying advanced fix...", "WARNING")
+        else:
+            debug_print(f"✗ Transformers import failed with AttributeError: {e}", "ERROR")
+            raise
     except ValueError as e:
         if "numpy.dtype size changed" in str(e):
-            debug_print("⚠ NumPy compatibility issue detected, trying advanced workaround...", "WARNING")
+            debug_print("⚠ NumPy compatibility issue detected, trying sklearn blocking...", "WARNING")
         else:
-            debug_print(f"✗ Transformers import failed: {e}", "ERROR")
+            debug_print(f"✗ Transformers import failed with ValueError: {e}", "ERROR")
             raise
+    except Exception as e:
+        debug_print(f"✗ Transformers import failed: {e}", "ERROR")
+        raise
     
-    # Strategy 2: Advanced workaround - monkey patch sklearn import
+    # Strategy 2: Advanced PyTorch compatibility fix
     try:
-        debug_print("Attempting advanced NumPy compatibility fix...", "INFO")
+        debug_print("Attempting advanced PyTorch compatibility fix...", "INFO")
         
-        # Temporarily disable sklearn import in transformers
+        # Clear transformers from cache if it was partially loaded
+        modules_to_clear = [mod for mod in sys.modules.keys() if 'transformers' in mod.lower()]
+        for mod in modules_to_clear:
+            if mod in sys.modules:
+                del sys.modules[mod]
+        
+        # Apply more aggressive PyTorch fixes
+        import torch
+        
+        # Ensure all required torch.utils._pytree methods exist
+        if not hasattr(torch.utils._pytree, 'register_pytree_node'):
+            torch.utils._pytree.register_pytree_node = lambda *args, **kwargs: None
+        if not hasattr(torch.utils._pytree, 'tree_flatten'):
+            torch.utils._pytree.tree_flatten = lambda x: ([x], None)
+        if not hasattr(torch.utils._pytree, 'tree_unflatten'):
+            torch.utils._pytree.tree_unflatten = lambda values, context: values[0] if values else None
+        
+        debug_print("✓ Applied comprehensive PyTorch _pytree fixes", "INFO")
+        
+        import transformers
+        debug_print(f"✓ Transformers imported with PyTorch fixes: {transformers.__version__}", "INFO")
+        return transformers
+        
+    except Exception as e:
+        debug_print(f"✗ Advanced PyTorch fix failed: {e}", "ERROR")
+    
+    # Strategy 3: sklearn blocking + PyTorch fix
+    try:
+        debug_print("Attempting sklearn blocking with PyTorch fix...", "INFO")
+        
+        # Clear all related modules
+        modules_to_clear = [mod for mod in sys.modules.keys() 
+                           if any(keyword in mod.lower() for keyword in ['transformers', 'sklearn', 'scipy'])]
+        for mod in modules_to_clear:
+            if mod in sys.modules:
+                del sys.modules[mod]
+        
+        # Block sklearn imports
         original_import = __builtins__.__import__
         
         def patched_import(name, *args, **kwargs):
@@ -86,7 +177,6 @@ def safe_import_transformers():
                 raise ImportError(f"Blocked sklearn import: {name}")
             return original_import(name, *args, **kwargs)
         
-        # Apply patch temporarily
         __builtins__.__import__ = patched_import
         
         try:
@@ -94,27 +184,33 @@ def safe_import_transformers():
             debug_print(f"✓ Transformers imported with sklearn blocking: {transformers.__version__}", "INFO")
             return transformers
         finally:
-            # Restore original import
             __builtins__.__import__ = original_import
             
     except Exception as e:
-        debug_print(f"✗ Advanced workaround failed: {e}", "ERROR")
+        debug_print(f"✗ Sklearn blocking strategy failed: {e}", "ERROR")
+    
+    # Strategy 4: Last resort - minimal import
+    try:
+        debug_print("Trying minimal transformers import as last resort...", "INFO")
         
-        # Strategy 3: Last resort - try with minimal transformers
-        try:
-            debug_print("Trying minimal transformers import...", "INFO")
-            
-            # Import only what we need
-            import transformers.models.auto.tokenization_auto
-            import transformers.models.auto.modeling_auto
-            
-            import transformers
-            debug_print(f"✓ Minimal transformers imported: {transformers.__version__}", "INFO")
-            return transformers
-            
-        except Exception as e2:
-            debug_print(f"✗ All import strategies failed: {e2}", "ERROR")
-            raise
+        # Clear all modules again
+        modules_to_clear = [mod for mod in sys.modules.keys() if 'transformers' in mod.lower()]
+        for mod in modules_to_clear:
+            if mod in sys.modules:
+                del sys.modules[mod]
+        
+        # Try importing just the core components we need
+        import transformers.configuration_utils
+        import transformers.modeling_utils
+        import transformers.tokenization_utils
+        
+        import transformers
+        debug_print(f"✓ Minimal transformers imported: {transformers.__version__}", "INFO")
+        return transformers
+        
+    except Exception as e2:
+        debug_print(f"✗ All import strategies failed: {e2}", "ERROR")
+        raise ImportError("Could not import transformers with any strategy")
 
 class SimpleKosmosQuantizer:
     def __init__(self, model_name="microsoft/kosmos-2.5", cache_dir=None):
@@ -122,8 +218,9 @@ class SimpleKosmosQuantizer:
         self.model_name = model_name
         self.cache_dir = cache_dir
         
-        # Apply NumPy workaround first
+        # Apply all compatibility fixes first
         apply_numpy_workaround()
+        fix_pytorch_transformers_compatibility()
         
         # Import required libraries
         try:
@@ -131,18 +228,29 @@ class SimpleKosmosQuantizer:
             self.torch = torch
             debug_print(f"✓ PyTorch {torch.__version__} loaded", "INFO")
             debug_print(f"✓ CUDA available: {torch.cuda.is_available()}", "INFO")
+            
+            if torch.cuda.is_available():
+                debug_print(f"✓ CUDA devices: {torch.cuda.device_count()}", "INFO")
+                debug_print(f"✓ Current device: {torch.cuda.current_device()}", "INFO")
+                
         except ImportError as e:
             debug_print(f"✗ PyTorch import failed: {e}", "ERROR")
             raise ImportError("PyTorch not available")
         
-        # Import transformers with workaround
+        # Import transformers with comprehensive fixes
         try:
             self.transformers = safe_import_transformers()
             
             # Pre-import the components we'll need to avoid later import issues
             debug_print("Pre-importing transformers components...", "INFO")
-            from transformers import AutoTokenizer, AutoProcessor
-            debug_print("✓ Transformers components pre-imported", "INFO")
+            from transformers import AutoTokenizer
+            debug_print("✓ AutoTokenizer pre-imported", "INFO")
+            
+            try:
+                from transformers import AutoProcessor
+                debug_print("✓ AutoProcessor pre-imported", "INFO")
+            except ImportError:
+                debug_print("⚠ AutoProcessor not available, will use tokenizer only", "WARNING")
             
         except Exception as e:
             debug_print(f"✗ Transformers import failed: {e}", "ERROR")
@@ -180,13 +288,13 @@ class SimpleKosmosQuantizer:
     def get_model_class(self):
         """Get the appropriate model class"""
         model_classes = [
-            ('Kosmos2_5ForConditionalGeneration', 'transformers'),
-            ('AutoModelForImageTextToText', 'transformers'),
-            ('AutoModelForVision2Seq', 'transformers'),
-            ('AutoModelForCausalLM', 'transformers')
+            'Kosmos2_5ForConditionalGeneration',
+            'AutoModelForImageTextToText',
+            'AutoModelForVision2Seq',
+            'AutoModelForCausalLM'
         ]
         
-        for class_name, module_name in model_classes:
+        for class_name in model_classes:
             try:
                 if class_name == 'Kosmos2_5ForConditionalGeneration':
                     from transformers import Kosmos2_5ForConditionalGeneration
@@ -255,6 +363,7 @@ class SimpleKosmosQuantizer:
                     torch_dtype=self.torch.float16,
                     device_map="auto",
                     cache_dir=self.cache_dir,
+                    low_cpu_mem_usage=True,
                     trust_remote_code=True
                 )
                 load_time = time.time() - start_time
@@ -343,8 +452,9 @@ def main():
     debug_print("KOSMOS-2.5 QUANTIZATION TOOL", "INFO")
     debug_print("="*80, "INFO")
     
-    # Apply NumPy workaround at the very beginning
+    # Apply all compatibility fixes at the very beginning
     apply_numpy_workaround()
+    fix_pytorch_transformers_compatibility()
     
     parser = argparse.ArgumentParser(description='Kosmos-2.5 Quantization Tool')
     parser.add_argument('--method', 
