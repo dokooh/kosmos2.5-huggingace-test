@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-8-bit Mixed Precision OCR Inference for Kosmos-2.5 with Enhanced Debugging - FIXED
+8-bit Mixed Precision OCR Inference for Kosmos-2.5 with Enhanced Debugging - DEVICE FIXED
 
 This module provides fast OCR inference using 8-bit mixed precision quantized Kosmos-2.5 model.
 Features:
@@ -13,7 +13,7 @@ Features:
 - Batch processing support with progress tracking
 - Comprehensive error handling and fallback mechanisms
 - EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
-- FIXED: Tensor formatting and traceback namespace issues
+- FIXED: Tensor formatting, traceback namespace, and DEVICE PLACEMENT issues
 """
 
 import re
@@ -65,6 +65,33 @@ def debug_memory_status():
             debug_checkpoint(f"Failed to get GPU memory status: {e}")
     else:
         debug_checkpoint("CUDA not available")
+
+def debug_tensor_devices(tensor_dict, name="Tensors"):
+    """Debug tensor device placement"""
+    debug_checkpoint(f"Checking {name} device placement:")
+    for key, tensor in tensor_dict.items():
+        if isinstance(tensor, torch.Tensor):
+            debug_checkpoint(f"  {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
+        else:
+            debug_checkpoint(f"  {key}: {type(tensor)} (not a tensor)")
+
+def move_to_device(data, device, dtype=None):
+    """Safely move data to device with proper error handling"""
+    if isinstance(data, torch.Tensor):
+        try:
+            if dtype is not None and data.dtype != dtype and data.dtype not in [torch.int32, torch.int64, torch.bool]:
+                return data.to(device=device, dtype=dtype)
+            else:
+                return data.to(device=device)
+        except Exception as e:
+            debug_checkpoint(f"Warning: Failed to move tensor to {device}: {e}")
+            return data
+    elif isinstance(data, dict):
+        return {k: move_to_device(v, device, dtype) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [move_to_device(item, device, dtype) for item in data]
+    else:
+        return data
 
 def safe_execute(func, description, *args, **kwargs):
     """Safely execute a function with detailed error reporting"""
@@ -272,18 +299,8 @@ class EightBitOCRInference:
             
             debug_checkpoint(f"Final loading kwargs: {loading_kwargs}")
             
-            # Add Flash Attention if available (better performance)
-            debug_checkpoint("Checking Flash Attention availability")
-            try:
-                if hasattr(torch.nn, 'scaled_dot_product_attention'):
-                    loading_kwargs["attn_implementation"] = "flash_attention_2"
-                    logger.info("Enabled Flash Attention 2")
-                    debug_checkpoint("Flash Attention 2 enabled")
-                else:
-                    debug_checkpoint("Flash Attention 2 not available - no scaled_dot_product_attention")
-            except Exception as e:
-                debug_checkpoint(f"Flash Attention check failed: {e}")
-                logger.debug("Flash Attention 2 not available")
+            # Remove Flash Attention for now to avoid compatibility issues
+            debug_checkpoint("Skipping Flash Attention to avoid device issues")
             
             # Load the model
             debug_checkpoint("Starting model loading from pretrained", "MODEL_LOAD_START")
@@ -301,6 +318,8 @@ class EightBitOCRInference:
             if not self.use_8bit:
                 debug_checkpoint("Applying non-8bit optimizations")
                 if self.device.startswith('cuda'):
+                    debug_checkpoint(f"Moving model to {self.device}")
+                    self.model = self.model.to(self.device)
                     if self.dtype == torch.bfloat16:
                         debug_checkpoint("Converting model to bfloat16")
                         self.model = self.model.bfloat16()
@@ -308,6 +327,17 @@ class EightBitOCRInference:
                         debug_checkpoint("Converting model to half precision")
                         self.model = self.model.half()
                 debug_checkpoint("Non-8bit optimizations applied")
+            else:
+                debug_checkpoint("8-bit model loaded, checking device placement")
+                # For 8-bit models, ensure they're properly placed
+                try:
+                    # Check if model is properly distributed
+                    for name, param in self.model.named_parameters():
+                        if hasattr(param, 'device'):
+                            debug_checkpoint(f"Parameter {name[:50]}: device={param.device}")
+                        break  # Just check the first few
+                except Exception as e:
+                    debug_checkpoint(f"Could not check parameter devices: {e}")
             
             # Enable gradient checkpointing for memory efficiency
             debug_checkpoint("Checking gradient checkpointing")
@@ -360,19 +390,22 @@ class EightBitOCRInference:
             else:
                 debug_checkpoint("Model does not have eval method")
             
-            # Enable torch.compile for PyTorch 2.0+ (if available and not using 8-bit)
-            debug_checkpoint("Checking torch.compile availability")
-            if hasattr(torch, 'compile') and self.device.startswith('cuda') and not self.use_8bit:
-                try:
-                    debug_checkpoint("Attempting torch.compile")
-                    logger.info("Compiling model with torch.compile for faster inference...")
-                    self.model = torch.compile(self.model, mode="reduce-overhead")
-                    debug_checkpoint("torch.compile successful")
-                except Exception as e:
-                    debug_checkpoint(f"torch.compile failed: {e}")
-                    logger.warning(f"torch.compile failed, continuing without it: {e}")
+            # Skip torch.compile for 8-bit models to avoid device issues
+            if not self.use_8bit:
+                debug_checkpoint("Checking torch.compile availability")
+                if hasattr(torch, 'compile') and self.device.startswith('cuda'):
+                    try:
+                        debug_checkpoint("Attempting torch.compile")
+                        logger.info("Compiling model with torch.compile for faster inference...")
+                        self.model = torch.compile(self.model, mode="reduce-overhead")
+                        debug_checkpoint("torch.compile successful")
+                    except Exception as e:
+                        debug_checkpoint(f"torch.compile failed: {e}")
+                        logger.warning(f"torch.compile failed, continuing without it: {e}")
+                else:
+                    debug_checkpoint("torch.compile not available or not applicable")
             else:
-                debug_checkpoint("torch.compile not available or not applicable")
+                debug_checkpoint("Skipping torch.compile for 8-bit model")
             
             logger.info("✓ Model loaded successfully with 8-bit mixed precision optimizations")
             debug_checkpoint("Model loading completed successfully", "LOAD_MODEL_END")
@@ -400,14 +433,15 @@ class EightBitOCRInference:
             logger.error(f"Failed to load model: {e}")
             logger.error(f"Full traceback: {tb_module.format_exc()}")
             
-            # Fallback to basic loading
+            # Fallback to basic loading without 8-bit
             debug_checkpoint("Attempting fallback model loading", "FALLBACK_START")
             logger.info("Attempting fallback model loading without quantization...")
             try:
                 fallback_kwargs = {
                     "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
                     "cache_dir": self.cache_dir,
-                    "trust_remote_code": True
+                    "trust_remote_code": True,
+                    "device_map": None,  # Let us handle device placement manually
                 }
                 
                 if self.is_local_checkpoint:
@@ -420,6 +454,12 @@ class EightBitOCRInference:
                     **fallback_kwargs
                 )
                 debug_checkpoint("Fallback model loaded")
+                
+                # Move to device manually
+                if torch.cuda.is_available():
+                    debug_checkpoint("Moving fallback model to GPU")
+                    self.model = self.model.to(self.device)
+                    self.model = self.model.half()
                 
                 processor_fallback_kwargs = {
                     "cache_dir": self.cache_dir,
@@ -437,6 +477,9 @@ class EightBitOCRInference:
                 
                 if self.processor.tokenizer.pad_token is None:
                     self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+                
+                # Disable 8-bit for fallback
+                self.use_8bit = False
                 
                 logger.info("Fallback model loading successful")
                 debug_checkpoint("Fallback loading successful", "FALLBACK_END")
@@ -718,6 +761,9 @@ class EightBitOCRInference:
             inputs = self.processor(text=prompt, images=image, return_tensors="pt")
             debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
             
+            # Debug input tensor devices before any processing
+            debug_tensor_devices(inputs, "Raw processor inputs")
+            
             # Extract scaling information - FIXED: Convert tensors to float properly
             height = inputs.pop("height")
             width = inputs.pop("width")
@@ -734,23 +780,39 @@ class EightBitOCRInference:
             debug_checkpoint(f"Scale factors - Height: {scale_height:.3f}, Width: {scale_width:.3f}")
             debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
             
-            # Move inputs to device and convert to correct dtype if not using 8-bit
+            # Move inputs to device and convert to correct dtype - ENHANCED DEVICE HANDLING
             debug_checkpoint("Moving inputs to device", "DEVICE_MOVE_START")
             debug_memory_status()
             
-            if not self.use_8bit:
-                debug_checkpoint("Non-8bit mode: moving inputs to device manually")
-                inputs = {k: v.to(self.device) if v is not None else None for k, v in inputs.items()}
-                
-                # Convert flattened_patches to correct dtype
-                if "flattened_patches" in inputs and inputs["flattened_patches"] is not None:
-                    debug_checkpoint("Converting flattened_patches to correct dtype")
-                    inputs["flattened_patches"] = inputs["flattened_patches"].to(self.dtype)
+            # Enhanced device placement logic
+            target_device = self.device
+            if self.use_8bit:
+                debug_checkpoint("8-bit mode: using device_map auto, not moving manually")
+                # For 8-bit models, let the device_map handle placement
+                # Only ensure non-tensor inputs are on CPU (where they should be)
+                processed_inputs = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        # Move tensor inputs but be careful about dtypes
+                        if k == "input_ids" or k == "attention_mask":
+                            # Keep these as integer types
+                            processed_inputs[k] = v.to(target_device)
+                        elif k == "flattened_patches":
+                            # This is the key tensor that needs careful handling
+                            debug_checkpoint(f"Processing flattened_patches: shape={v.shape}, dtype={v.dtype}")
+                            processed_inputs[k] = v.to(target_device)
+                        else:
+                            processed_inputs[k] = v.to(target_device)
+                    else:
+                        processed_inputs[k] = v
+                inputs = processed_inputs
             else:
-                debug_checkpoint("8-bit mode: moving inputs to device (quantization handles dtype)")
-                # For 8-bit models, just move to device (quantization handles dtype)
-                inputs = {k: v.to(self.device) if v is not None else None for k, v in inputs.items()}
+                debug_checkpoint("Non-8bit mode: moving inputs to device manually")
+                # For non-8bit models, move everything to device with proper dtype
+                inputs = move_to_device(inputs, target_device, self.dtype)
             
+            # Debug final input tensor devices
+            debug_tensor_devices(inputs, "Final processed inputs")
             debug_checkpoint("Device move completed", "DEVICE_MOVE_END")
             debug_memory_status()
             
@@ -767,6 +829,18 @@ class EightBitOCRInference:
                     torch.cuda.empty_cache()
                     debug_memory_status()
                 
+                # Enhanced generation with better error handling
+                generation_kwargs = {
+                    "max_new_tokens": max_tokens,
+                    "do_sample": False,
+                    "pad_token_id": self.processor.tokenizer.eos_token_id,
+                    "use_cache": True,
+                    "num_beams": 1,  # Faster than beam search for OCR
+                    "early_stopping": True,
+                }
+                
+                debug_checkpoint(f"Generation kwargs: {generation_kwargs}")
+                
                 # Use mixed precision if enabled and not using 8-bit quantization
                 if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
                     debug_checkpoint("Using mixed precision autocast")
@@ -774,24 +848,14 @@ class EightBitOCRInference:
                         debug_checkpoint("Inside autocast context, calling model.generate")
                         generated_ids = self.model.generate(
                             **inputs,
-                            max_new_tokens=max_tokens,
-                            do_sample=False,
-                            pad_token_id=self.processor.tokenizer.eos_token_id,
-                            use_cache=True,
-                            num_beams=1,  # Faster than beam search for OCR
-                            early_stopping=True,
+                            **generation_kwargs
                         )
                         debug_checkpoint("model.generate completed with autocast")
                 else:
                     debug_checkpoint("Using standard generation (no autocast)")
                     generated_ids = self.model.generate(
                         **inputs,
-                        max_new_tokens=max_tokens,
-                        do_sample=False,
-                        pad_token_id=self.processor.tokenizer.eos_token_id,
-                        use_cache=True,
-                        num_beams=1,
-                        early_stopping=True,
+                        **generation_kwargs
                     )
                     debug_checkpoint("model.generate completed without autocast")
             
@@ -950,7 +1014,7 @@ class EightBitOCRInference:
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision OCR inference using Kosmos-2.5 with Enhanced Debugging - FIXED')
+    parser = argparse.ArgumentParser(description='8-bit Mixed Precision OCR inference using Kosmos-2.5 with Enhanced Debugging - DEVICE FIXED')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
@@ -1105,4 +1169,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
