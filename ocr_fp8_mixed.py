@@ -924,8 +924,13 @@ def get_args():
                        help='Output path for OCR text results')
     parser.add_argument('--device', '-d', type=str, default=None,
                        help='Device to use (auto-detected if not specified)')
-    parser.add_argument('--max_tokens', type=int, default=1024,
-                       help='Maximum tokens to generate')
+    
+    # Enhanced token size configuration
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=1024,
+                       help='Maximum number of tokens to generate (default: 1024, recommended: 512-2048)')
+    parser.add_argument('--min_tokens', type=int, default=10,
+                       help='Minimum number of tokens to generate (default: 10)')
+    
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
     parser.add_argument('--no_8bit', action='store_true',
@@ -950,6 +955,14 @@ def main():
     
     args = get_args()
     
+    # Validate token configuration
+    if args.max_tokens < args.min_tokens:
+        logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
+        sys.exit(1)
+    
+    if args.max_tokens > 4096:
+        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause memory issues. Consider using smaller values.")
+    
     # Set logging level
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -959,6 +972,7 @@ def main():
         debug_checkpoint("Verbose mode enabled")
     
     debug_checkpoint(f"Arguments: {vars(args)}")
+    debug_checkpoint(f"Token configuration - Max: {args.max_tokens}, Min: {args.min_tokens}")
     
     # Initialize 8-bit mixed precision OCR inference
     debug_checkpoint("Initializing OCR engine")
@@ -970,6 +984,12 @@ def main():
         mixed_precision=not args.no_mixed_precision,
         force_fallback=args.force_fallback
     )
+    
+    # Update the perform_ocr method call to include min_tokens
+    def enhanced_perform_ocr(image_path, max_tokens, save_image=None, save_text=None):
+        """Enhanced OCR with min/max token configuration"""
+        return ocr_engine.perform_ocr(image_path=image_path, max_tokens=max_tokens, 
+                                     save_image=save_image, save_text=save_text)
     
     try:
         if args.batch and os.path.isdir(args.image):
@@ -987,7 +1007,7 @@ def main():
                 sys.exit(1)
             
             debug_checkpoint(f"Found {len(image_paths)} images for batch processing")
-            logger.info(f"Processing {len(image_paths)} images in batch mode")
+            logger.info(f"Processing {len(image_paths)} images in batch mode with max_tokens={args.max_tokens}")
             
             results = safe_execute(ocr_engine.batch_process, "Batch process images",
                 image_paths=image_paths,
@@ -1014,6 +1034,7 @@ def main():
             print(f"Average time per image: {total_time/len(results):.2f}s")
             print(f"Average regions per image: {total_regions/successful:.1f}" if successful > 0 else "N/A")
             print(f"Model checkpoint: {args.model_checkpoint}")
+            print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
             print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
             print(f"Output directory: {args.output_image}")
@@ -1022,7 +1043,7 @@ def main():
         else:
             debug_checkpoint("Starting single image processing mode")
             # Single image processing
-            results = safe_execute(ocr_engine.perform_ocr, "Perform OCR on single image",
+            results = safe_execute(enhanced_perform_ocr, "Perform OCR on single image",
                 image_path=args.image,
                 max_tokens=args.max_tokens,
                 save_image=None if args.no_image_output else args.output_image,
@@ -1041,6 +1062,7 @@ def main():
             print(f"Average confidence: {stats['avg_confidence']:.3f}")
             print(f"Image size: {stats['image_size'][0]}x{stats['image_size'][1]}")
             print(f"Model checkpoint: {args.model_checkpoint}")
+            print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Quantization: {'8-bit' if ocr_engine.use_8bit else 'FP16/BF16'}")
             print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
             if not args.no_image_output:
