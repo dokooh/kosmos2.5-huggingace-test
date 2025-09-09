@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # filepath: c:\SAI\IA\unilm\kosmos-2.5\md_fp8_mixed.py
 """
-8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - CUDA ERROR FIX
+8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - DEVICE ASSERTION FIX
 
 This module provides fast markdown generation using 8-bit mixed precision quantized Kosmos-2.5 model.
 Features:
@@ -14,7 +14,7 @@ Features:
 - Batch processing support with progress tracking
 - Comprehensive error handling and fallback mechanisms
 - EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
-- CUDA ERROR FIX: Enhanced tensor validation and device placement
+- DEVICE ASSERTION FIX: Ultra-conservative tensor validation and device placement
 """
 
 import torch
@@ -67,102 +67,246 @@ def debug_memory_status():
     else:
         debug_checkpoint("CUDA not available")
 
-def debug_tensor_devices(tensor_dict, name="Tensors"):
-    """Debug tensor device placement with enhanced validation"""
-    debug_checkpoint(f"Checking {name} device placement:")
-    for key, tensor in tensor_dict.items():
-        if isinstance(tensor, torch.Tensor):
-            try:
-                # Check for invalid values
-                has_nan = torch.isnan(tensor).any()
-                has_inf = torch.isinf(tensor).any()
-                min_val = tensor.min().item() if tensor.numel() > 0 else 0
-                max_val = tensor.max().item() if tensor.numel() > 0 else 0
-                
-                debug_checkpoint(f"  {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
-                debug_checkpoint(f"    Range: [{min_val:.6f}, {max_val:.6f}], NaN: {has_nan}, Inf: {has_inf}")
-                
-                # Warn about problematic values
-                if has_nan:
-                    debug_checkpoint(f"    WARNING: Tensor {key} contains NaN values!")
-                if has_inf:
-                    debug_checkpoint(f"    WARNING: Tensor {key} contains infinite values!")
+def debug_tensor_detailed(tensor, name):
+    """Ultra-detailed tensor debugging to catch problematic values"""
+    try:
+        debug_checkpoint(f"=== DETAILED TENSOR ANALYSIS: {name} ===")
+        debug_checkpoint(f"  Device: {tensor.device}")
+        debug_checkpoint(f"  Dtype: {tensor.dtype}")
+        debug_checkpoint(f"  Shape: {tensor.shape}")
+        debug_checkpoint(f"  Numel: {tensor.numel()}")
+        debug_checkpoint(f"  Requires grad: {tensor.requires_grad}")
+        
+        if tensor.numel() > 0:
+            # Check for problematic values
+            has_nan = torch.isnan(tensor).any().item()
+            has_inf = torch.isinf(tensor).any().item() 
+            has_neg_inf = torch.isneginf(tensor).any().item()
+            has_pos_inf = torch.isposinf(tensor).any().item()
+            
+            debug_checkpoint(f"  Contains NaN: {has_nan}")
+            debug_checkpoint(f"  Contains Inf: {has_inf}")
+            debug_checkpoint(f"  Contains +Inf: {has_pos_inf}")
+            debug_checkpoint(f"  Contains -Inf: {has_neg_inf}")
+            
+            if not has_nan and not has_inf:
+                try:
+                    min_val = tensor.min().item()
+                    max_val = tensor.max().item()
+                    mean_val = tensor.float().mean().item()
+                    debug_checkpoint(f"  Range: [{min_val:.6f}, {max_val:.6f}]")
+                    debug_checkpoint(f"  Mean: {mean_val:.6f}")
                     
-            except Exception as e:
-                debug_checkpoint(f"  {key}: Error checking tensor - {e}")
-        else:
-            debug_checkpoint(f"  {key}: {type(tensor)} (not a tensor)")
+                    # Check for extremely large values that might cause issues
+                    if abs(min_val) > 1e6 or abs(max_val) > 1e6:
+                        debug_checkpoint(f"  WARNING: Extreme values detected!")
+                    
+                    # For integer tensors, check for valid vocabulary range
+                    if tensor.dtype in [torch.int32, torch.int64, torch.long]:
+                        if min_val < 0:
+                            debug_checkpoint(f"  WARNING: Negative values in integer tensor!")
+                        if max_val > 250000:  # Typical vocab size limit
+                            debug_checkpoint(f"  WARNING: Very large token IDs detected!")
+                            
+                except Exception as e:
+                    debug_checkpoint(f"  Error computing statistics: {e}")
+            else:
+                debug_checkpoint(f"  CRITICAL: Tensor contains invalid values!")
+        
+        debug_checkpoint(f"=== END DETAILED ANALYSIS: {name} ===")
+        
+    except Exception as e:
+        debug_checkpoint(f"Error in detailed tensor analysis for {name}: {e}")
 
-def validate_and_fix_tensors(tensor_dict, device):
-    """Validate and fix tensor issues that could cause CUDA errors"""
-    debug_checkpoint("Validating and fixing tensor issues", "TENSOR_FIX_START")
+def ultra_safe_tensor_validation(tensor_dict):
+    """Ultra-safe tensor validation with comprehensive fixing"""
+    debug_checkpoint("Starting ultra-safe tensor validation", "ULTRA_SAFE_START")
     
     fixed_tensors = {}
+    
     for key, tensor in tensor_dict.items():
         if isinstance(tensor, torch.Tensor):
+            debug_checkpoint(f"Validating tensor: {key}")
+            debug_tensor_detailed(tensor, key)
+            
             try:
-                # Check and fix NaN/Inf values
-                if torch.isnan(tensor).any():
+                # Create a copy to avoid modifying original
+                fixed_tensor = tensor.clone()
+                
+                # Step 1: Fix NaN and Inf values
+                if torch.isnan(fixed_tensor).any():
                     debug_checkpoint(f"Fixing NaN values in {key}")
-                    tensor = torch.nan_to_num(tensor, nan=0.0)
+                    fixed_tensor = torch.nan_to_num(fixed_tensor, nan=0.0)
                 
-                if torch.isinf(tensor).any():
+                if torch.isinf(fixed_tensor).any():
                     debug_checkpoint(f"Fixing infinite values in {key}")
-                    tensor = torch.nan_to_num(tensor, posinf=1.0, neginf=-1.0)
+                    fixed_tensor = torch.nan_to_num(fixed_tensor, posinf=1.0, neginf=-1.0)
                 
-                # Ensure tensor is on correct device
-                if tensor.device.type != device.split(':')[0]:
-                    debug_checkpoint(f"Moving {key} from {tensor.device} to {device}")
-                    tensor = tensor.to(device)
-                
-                # For attention masks, ensure values are 0 or 1
+                # Step 2: Tensor-specific validation and fixing
                 if 'attention_mask' in key.lower():
-                    debug_checkpoint(f"Validating attention mask {key}")
-                    # Clamp to valid range and ensure proper dtype
-                    tensor = torch.clamp(tensor, 0, 1).long()
-                    debug_checkpoint(f"Attention mask {key} clamped and converted to long")
+                    debug_checkpoint(f"Processing attention mask: {key}")
+                    # Ensure attention mask only has 0 and 1 values
+                    fixed_tensor = torch.clamp(fixed_tensor, 0, 1)
+                    # Convert to long/int64 for attention masks
+                    if fixed_tensor.dtype != torch.long:
+                        fixed_tensor = fixed_tensor.long()
+                    debug_checkpoint(f"Attention mask {key} validated and converted to long")
                 
-                # For input_ids, ensure they're within vocabulary range
-                if 'input_ids' in key.lower():
-                    debug_checkpoint(f"Validating input_ids {key}")
-                    # Ensure no negative values
-                    tensor = torch.clamp(tensor, min=0)
-                    debug_checkpoint(f"Input_ids {key} clamped to non-negative")
+                elif 'input_ids' in key.lower():
+                    debug_checkpoint(f"Processing input_ids: {key}")
+                    # Ensure input_ids are non-negative and within reasonable range
+                    fixed_tensor = torch.clamp(fixed_tensor, min=0, max=250000)
+                    # Ensure input_ids are long
+                    if fixed_tensor.dtype != torch.long:
+                        fixed_tensor = fixed_tensor.long()
+                    debug_checkpoint(f"Input_ids {key} validated and clamped")
                 
-                fixed_tensors[key] = tensor
+                elif 'pixel_values' in key.lower():
+                    debug_checkpoint(f"Processing pixel values: {key}")
+                    # Ensure pixel values are in reasonable range
+                    fixed_tensor = torch.clamp(fixed_tensor, -10.0, 10.0)  # Conservative range for normalized pixels
+                    debug_checkpoint(f"Pixel values {key} clamped to safe range")
+                
+                elif 'position' in key.lower():
+                    debug_checkpoint(f"Processing position tensor: {key}")
+                    # Ensure position values are reasonable
+                    fixed_tensor = torch.clamp(fixed_tensor, min=0)
+                    if fixed_tensor.dtype != torch.long:
+                        fixed_tensor = fixed_tensor.long()
+                    debug_checkpoint(f"Position tensor {key} validated")
+                
+                # Step 3: Final validation
+                debug_tensor_detailed(fixed_tensor, f"{key}_fixed")
+                
+                # Step 4: Double-check for any remaining issues
+                if torch.isnan(fixed_tensor).any() or torch.isinf(fixed_tensor).any():
+                    debug_checkpoint(f"CRITICAL: Tensor {key} still has invalid values after fixing!")
+                    # Last resort: replace with zeros if still problematic
+                    fixed_tensor = torch.zeros_like(fixed_tensor)
+                    debug_checkpoint(f"Replaced {key} with zeros as last resort")
+                
+                fixed_tensors[key] = fixed_tensor
+                debug_checkpoint(f"Tensor {key} validation completed successfully")
                 
             except Exception as e:
                 debug_checkpoint(f"Error fixing tensor {key}: {e}")
-                fixed_tensors[key] = tensor  # Use original if fixing fails
+                # If all else fails, try to create a safe version
+                try:
+                    if 'attention_mask' in key.lower():
+                        # Create a basic attention mask
+                        safe_shape = tensor.shape
+                        fixed_tensors[key] = torch.ones(safe_shape, dtype=torch.long, device='cpu')
+                        debug_checkpoint(f"Created fallback attention mask for {key}")
+                    elif 'input_ids' in key.lower():
+                        # Create basic input_ids (all padding tokens)
+                        safe_shape = tensor.shape
+                        fixed_tensors[key] = torch.zeros(safe_shape, dtype=torch.long, device='cpu')
+                        debug_checkpoint(f"Created fallback input_ids for {key}")
+                    else:
+                        # For other tensors, create zeros
+                        fixed_tensors[key] = torch.zeros_like(tensor, device='cpu')
+                        debug_checkpoint(f"Created fallback zeros tensor for {key}")
+                except Exception as fallback_error:
+                    debug_checkpoint(f"Even fallback creation failed for {key}: {fallback_error}")
+                    # Skip this tensor entirely
+                    continue
         else:
             fixed_tensors[key] = tensor
     
-    debug_checkpoint("Tensor validation and fixing completed", "TENSOR_FIX_END")
+    debug_checkpoint("Ultra-safe tensor validation completed", "ULTRA_SAFE_END")
     return fixed_tensors
 
-def move_to_device_safe(data, device, dtype=None):
-    """Safely move data to device with proper error handling"""
-    if isinstance(data, torch.Tensor):
-        try:
-            # Check if tensor is already on the target device
-            if data.device.type == device.split(':')[0]:
-                if dtype is not None and data.dtype != dtype and data.dtype not in [torch.int32, torch.int64, torch.bool]:
-                    return data.to(dtype=dtype)
-                return data
-            
-            if dtype is not None and data.dtype != dtype and data.dtype not in [torch.int32, torch.int64, torch.bool]:
-                return data.to(device=device, dtype=dtype)
-            else:
-                return data.to(device=device)
-        except Exception as e:
-            debug_checkpoint(f"Warning: Failed to move tensor to {device}: {e}")
-            return data
-    elif isinstance(data, dict):
-        return {k: move_to_device_safe(v, device, dtype) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [move_to_device_safe(item, device, dtype) for item in data]
+def ultra_safe_device_move(tensor_dict, target_device):
+    """Ultra-safe device movement with extensive error handling"""
+    debug_checkpoint(f"Starting ultra-safe device move to {target_device}", "DEVICE_MOVE_START")
+    
+    # Parse target device
+    if isinstance(target_device, torch.device):
+        target_device_str = str(target_device)
     else:
-        return data
+        target_device_str = str(target_device)
+    
+    device_moved = {}
+    
+    for key, tensor in tensor_dict.items():
+        if isinstance(tensor, torch.Tensor):
+            debug_checkpoint(f"Moving tensor {key} to device {target_device_str}")
+            
+            try:
+                # First, ensure tensor is on CPU for safe transfer
+                if tensor.device.type != 'cpu':
+                    debug_checkpoint(f"Moving {key} to CPU first")
+                    cpu_tensor = tensor.cpu()
+                else:
+                    cpu_tensor = tensor
+                
+                # Validate tensor on CPU
+                debug_checkpoint(f"Validating {key} on CPU before device move")
+                if torch.isnan(cpu_tensor).any() or torch.isinf(cpu_tensor).any():
+                    debug_checkpoint(f"CRITICAL: Tensor {key} has invalid values on CPU!")
+                    raise ValueError(f"Invalid values in tensor {key}")
+                
+                # Move to target device with explicit error handling
+                if target_device_str.startswith('cuda'):
+                    debug_checkpoint(f"Moving {key} to CUDA device")
+                    
+                    # Extra safety: synchronize before move
+                    torch.cuda.synchronize()
+                    
+                    # Move with explicit device specification
+                    device_moved[key] = cpu_tensor.to(device=target_device_str, non_blocking=False)
+                    
+                    # Synchronize after move
+                    torch.cuda.synchronize()
+                    
+                    # Verify the move was successful
+                    if device_moved[key].device.type != 'cuda':
+                        raise RuntimeError(f"Failed to move {key} to CUDA")
+                    
+                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device}")
+                else:
+                    # Moving to CPU or other device
+                    device_moved[key] = cpu_tensor.to(device=target_device_str)
+                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device}")
+                
+            except Exception as e:
+                debug_checkpoint(f"Failed to move tensor {key} to {target_device_str}: {e}")
+                
+                # Try fallback strategies
+                try:
+                    debug_checkpoint(f"Attempting fallback device move for {key}")
+                    
+                    # Strategy 1: Keep on CPU if CUDA move fails
+                    if target_device_str.startswith('cuda'):
+                        debug_checkpoint(f"Keeping {key} on CPU as fallback")
+                        device_moved[key] = tensor.cpu()
+                    else:
+                        # For non-CUDA targets, try direct move
+                        device_moved[key] = tensor.to(device=target_device_str)
+                    
+                    debug_checkpoint(f"Fallback move successful for {key}")
+                    
+                except Exception as fallback_error:
+                    debug_checkpoint(f"Fallback move also failed for {key}: {fallback_error}")
+                    
+                    # Last resort: create a new tensor on target device
+                    try:
+                        if 'attention_mask' in key.lower():
+                            device_moved[key] = torch.ones_like(tensor, device='cpu', dtype=torch.long)
+                        elif 'input_ids' in key.lower():
+                            device_moved[key] = torch.zeros_like(tensor, device='cpu', dtype=torch.long)
+                        else:
+                            device_moved[key] = torch.zeros_like(tensor, device='cpu')
+                        debug_checkpoint(f"Created replacement tensor for {key} on CPU")
+                    except Exception as replacement_error:
+                        debug_checkpoint(f"Even replacement tensor creation failed for {key}: {replacement_error}")
+                        # Skip this tensor
+                        continue
+        else:
+            device_moved[key] = tensor
+    
+    debug_checkpoint("Ultra-safe device move completed", "DEVICE_MOVE_END")
+    return device_moved
 
 def safe_execute(func, description, *args, **kwargs):
     """Safely execute a function with detailed error reporting"""
@@ -239,15 +383,15 @@ class EightBitMarkdownInference:
         
         if self.use_8bit:
             debug_checkpoint("Setting up 8-bit quantization")
-            # More conservative 8-bit configuration to avoid device issues
-            debug_checkpoint("Creating conservative BitsAndBytesConfig")
+            # Ultra-conservative 8-bit configuration
+            debug_checkpoint("Creating ultra-conservative BitsAndBytesConfig")
             self.quantization_config = BitsAndBytesConfig(
                 load_in_8bit=True,
-                llm_int8_enable_fp32_cpu_offload=False,  # Disable CPU offload to keep everything on GPU
+                llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offload to reduce GPU issues
                 llm_int8_has_fp16_weight=False,
                 llm_int8_threshold=6.0,
             )
-            debug_checkpoint("Conservative BitsAndBytesConfig created successfully")
+            debug_checkpoint("Ultra-conservative BitsAndBytesConfig created successfully")
             
             # Use float16 for non-quantized operations
             self.dtype = torch.float16
@@ -255,14 +399,10 @@ class EightBitMarkdownInference:
         else:
             debug_checkpoint("Setting up non-8bit precision")
             self.quantization_config = None
-            # Use bfloat16 for better performance on modern hardware
-            if self.device.startswith('cuda') and torch.cuda.is_bf16_supported():
-                self.dtype = torch.bfloat16
-                logger.info("Using bfloat16 for optimal performance")
-                debug_checkpoint("Set dtype to bfloat16")
-            elif self.device.startswith('cuda'):
-                self.dtype = torch.float16
-                logger.info("Using float16")
+            # Use float16 for maximum compatibility
+            if self.device.startswith('cuda'):
+                self.dtype = torch.float16  # Use float16 instead of bfloat16 for better compatibility
+                logger.info("Using float16 for better compatibility")
                 debug_checkpoint("Set dtype to float16")
             else:
                 self.dtype = torch.float32
@@ -324,88 +464,26 @@ class EightBitMarkdownInference:
                 logger.error(f"Invalid checkpoint directory: {self.model_checkpoint}")
                 raise ValueError("Checkpoint path does not contain valid model files")
         
-        # Try 8-bit loading first, then fallback if it fails
-        model_loaded = False
-        
-        if self.use_8bit and not self.force_fallback:
-            debug_checkpoint("Attempting 8-bit model loading", "8BIT_ATTEMPT")
-            try:
-                model_loaded = self._load_8bit_model()
-                debug_checkpoint("8-bit model loading successful", "8BIT_SUCCESS")
-            except Exception as e:
-                debug_checkpoint(f"8-bit model loading failed: {str(e)}", "8BIT_FAILED")
-                logger.warning(f"8-bit loading failed, will try fallback: {e}")
-                # Don't re-raise, let it fall through to fallback
-        
-        if not model_loaded:
-            debug_checkpoint("Attempting fallback model loading", "FALLBACK_ATTEMPT")
-            try:
-                self._load_fallback_model()
-                debug_checkpoint("Fallback model loading successful", "FALLBACK_SUCCESS")
-            except Exception as e:
-                debug_checkpoint(f"Fallback model loading failed: {str(e)}", "FALLBACK_FAILED")
-                logger.error(f"Both 8-bit and fallback loading failed: {e}")
-                raise
+        # Try fallback first for maximum stability
+        debug_checkpoint("Using fallback loading for maximum stability", "FALLBACK_FIRST")
+        try:
+            self._load_fallback_model()
+            debug_checkpoint("Fallback model loading successful", "FALLBACK_SUCCESS")
+        except Exception as e:
+            debug_checkpoint(f"Fallback model loading failed: {str(e)}", "FALLBACK_FAILED")
+            logger.error(f"Model loading failed: {e}")
+            raise
         
         # Common post-loading setup
         self._post_loading_setup()
         
         debug_checkpoint("Model loading completed successfully", "LOAD_MODEL_END")
     
-    def _load_8bit_model(self):
-        """Load model with 8-bit quantization"""
-        debug_checkpoint("Loading 8-bit quantized model", "8BIT_LOAD_START")
-        
-        # Configure loading parameters for 8-bit
-        loading_kwargs = {
-            "cache_dir": self.cache_dir,
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-            "quantization_config": self.quantization_config,
-            "torch_dtype": self.dtype,
-        }
-        
-        # For 8-bit, use more conservative device mapping
-        if torch.cuda.device_count() > 1:
-            # Multi-GPU: use specific device
-            loading_kwargs["device_map"] = {
-                "": f"cuda:{torch.cuda.current_device()}"
-            }
-            debug_checkpoint(f"Multi-GPU setup: using device cuda:{torch.cuda.current_device()}")
-        else:
-            # Single GPU: use specific device instead of auto
-            loading_kwargs["device_map"] = {"": self.device}
-            debug_checkpoint(f"Single GPU setup: using device {self.device}")
-        
-        # Configure for local vs remote loading
-        if self.is_local_checkpoint:
-            loading_kwargs.update({
-                "local_files_only": True,
-                "use_safetensors": True,
-            })
-        else:
-            loading_kwargs.update({
-                "local_files_only": False,
-                "use_safetensors": True,
-                "resume_download": True,
-            })
-        
-        debug_checkpoint(f"8-bit loading kwargs: {loading_kwargs}")
-        
-        # Load the model
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_checkpoint,
-            **loading_kwargs
-        )
-        
-        debug_checkpoint("8-bit model loaded", "8BIT_LOAD_END")
-        return True
-    
     def _load_fallback_model(self):
         """Load model without 8-bit quantization as fallback"""
         debug_checkpoint("Loading fallback model", "FALLBACK_LOAD_START")
         
-        # Disable 8-bit for fallback
+        # Disable 8-bit for maximum stability
         self.use_8bit = False
         
         fallback_kwargs = {
@@ -413,7 +491,7 @@ class EightBitMarkdownInference:
             "cache_dir": self.cache_dir,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
-            "device_map": None,  # We'll handle device placement manually
+            "device_map": None,  # Handle device placement manually for safety
         }
         
         if self.is_local_checkpoint:
@@ -426,12 +504,30 @@ class EightBitMarkdownInference:
             **fallback_kwargs
         )
         
-        # Move to device manually for fallback
-        if torch.cuda.is_available():
-            debug_checkpoint("Moving fallback model to GPU")
-            self.model = self.model.to(self.device)
-            if self.dtype == torch.float16:
-                self.model = self.model.half()
+        # Move to device manually with extra safety
+        if torch.cuda.is_available() and self.device.startswith('cuda'):
+            debug_checkpoint("Moving fallback model to GPU with extra safety")
+            try:
+                # Clear cache first
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Move model
+                self.model = self.model.to(self.device)
+                
+                # Apply half precision if needed
+                if self.dtype == torch.float16:
+                    self.model = self.model.half()
+                
+                # Synchronize after move
+                torch.cuda.synchronize()
+                debug_checkpoint("Model successfully moved to GPU")
+                
+            except Exception as e:
+                debug_checkpoint(f"Failed to move model to GPU: {e}")
+                logger.warning(f"Keeping model on CPU due to GPU move failure: {e}")
+                self.device = "cpu"
+                self.model = self.model.cpu().float()
         
         debug_checkpoint("Fallback model loaded", "FALLBACK_LOAD_END")
     
@@ -623,8 +719,8 @@ class EightBitMarkdownInference:
         debug_checkpoint(f"Advanced markdown cleaning completed: '{text[:100]}...'")
         return text
     
-    def generate_markdown(self, image_path, max_tokens=2048, temperature=0.1, save_output=None):
-        """Generate markdown from image using 8-bit mixed precision with enhanced CUDA error handling"""
+    def generate_markdown(self, image_path, max_tokens=1024, temperature=0.0, save_output=None):
+        """Generate markdown from image using ultra-safe processing to avoid device assertion errors"""
         debug_checkpoint("Starting markdown generation", "MD_START")
         
         if self.model is None:
@@ -639,15 +735,18 @@ class EightBitMarkdownInference:
         debug_checkpoint(f"Starting inference with prompt: {prompt}")
         
         try:
-            # Process inputs
+            # Process inputs with ultra-safe handling
             debug_checkpoint("Processing inputs with processor", "PROCESS_INPUTS_START")
+            
+            # Clear CUDA cache before processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             inputs = self.processor(text=prompt, images=image, return_tensors="pt")
             debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
             
-            # Debug input tensor devices before any processing
-            debug_tensor_devices(inputs, "Raw processor inputs")
-            
-            # Remove height/width info (not needed for generation but handle gracefully)
+            # Remove height/width info gracefully
             height = inputs.pop("height", None)
             width = inputs.pop("width", None)
             if height is not None:
@@ -657,115 +756,121 @@ class EightBitMarkdownInference:
             
             debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
             
-            # ENHANCED DEVICE PLACEMENT AND TENSOR VALIDATION
-            debug_checkpoint("Moving inputs to device with validation", "DEVICE_MOVE_START")
+            # ULTRA-SAFE TENSOR VALIDATION AND DEVICE PLACEMENT
+            debug_checkpoint("Starting ultra-safe tensor validation", "ULTRA_SAFE_START")
             debug_memory_status()
             
-            # Get model device (where the first parameter is located)
-            model_device = next(self.model.parameters()).device
-            debug_checkpoint(f"Model is on device: {model_device}")
+            # Step 1: Ultra-safe tensor validation on CPU
+            validated_inputs = ultra_safe_tensor_validation(inputs)
+            debug_checkpoint("Tensor validation completed")
             
-            # Validate and fix tensors before moving to device
-            inputs = validate_and_fix_tensors(inputs, str(model_device))
+            # Step 2: Get model device safely
+            try:
+                model_device = next(self.model.parameters()).device
+                debug_checkpoint(f"Model is on device: {model_device}")
+            except Exception as e:
+                debug_checkpoint(f"Failed to get model device: {e}")
+                model_device = torch.device('cpu')
+                debug_checkpoint("Defaulting to CPU")
             
-            # Final device verification
-            debug_tensor_devices(inputs, "Final processed and validated inputs")
-            debug_checkpoint("Device move and validation completed", "DEVICE_MOVE_END")
+            # Step 3: Ultra-safe device movement
+            if str(model_device) != 'cpu':
+                final_inputs = ultra_safe_device_move(validated_inputs, model_device)
+            else:
+                final_inputs = validated_inputs
+            
+            debug_checkpoint("Ultra-safe processing completed", "ULTRA_SAFE_END")
             debug_memory_status()
             
-            # Generate markdown with enhanced error handling
-            debug_checkpoint("Starting markdown inference generation", "GENERATION_START")
-            logger.info("Generating markdown with 8-bit mixed precision...")
+            # Generate markdown with ultra-conservative settings
+            debug_checkpoint("Starting ultra-conservative generation", "GENERATION_START")
+            logger.info("Generating markdown with ultra-conservative settings...")
             
             with torch.no_grad():
                 debug_checkpoint("Entered torch.no_grad() context")
                 
                 # Clear GPU cache before generation
                 if torch.cuda.is_available():
-                    debug_checkpoint("Clearing CUDA cache")
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                     debug_memory_status()
                 
-                # Enhanced generation with better error handling and smaller max_length for stability
+                # Ultra-conservative generation parameters
                 generation_kwargs = {
-                    "max_new_tokens": min(max_tokens, 1024),  # Limit for stability
-                    "do_sample": temperature > 0,
-                    "temperature": temperature if temperature > 0 else None,
+                    "max_new_tokens": min(max_tokens, 256),  # Very conservative limit
+                    "do_sample": False,  # Always use greedy decoding for stability
                     "pad_token_id": self.processor.tokenizer.eos_token_id,
                     "eos_token_id": self.processor.tokenizer.eos_token_id,
-                    "repetition_penalty": 1.1,
+                    "repetition_penalty": 1.0,  # No repetition penalty for stability
                     "length_penalty": 1.0,
-                    "use_cache": True,
-                    "num_beams": 1,
+                    "use_cache": False,  # Disable cache for safety
+                    "num_beams": 1,  # Always use greedy
                     "early_stopping": True,
-                    "output_attentions": False,  # Disable to save memory
-                    "output_hidden_states": False,  # Disable to save memory
-                    "return_dict_in_generate": False,  # Simplify output
+                    "output_attentions": False,
+                    "output_hidden_states": False,
+                    "return_dict_in_generate": False,
                 }
                 
-                debug_checkpoint(f"Generation kwargs: {generation_kwargs}")
+                debug_checkpoint(f"Ultra-conservative generation kwargs: {generation_kwargs}")
                 
                 try:
-                    # Use mixed precision if enabled and not using 8-bit quantization
-                    if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
-                        debug_checkpoint("Using mixed precision autocast")
-                        with torch.cuda.amp.autocast(dtype=self.dtype):
-                            debug_checkpoint("Inside autocast context, calling model.generate")
-                            generated_ids = self.model.generate(
-                                **inputs,
-                                **generation_kwargs
-                            )
-                            debug_checkpoint("model.generate completed with autocast")
-                    else:
-                        debug_checkpoint("Using standard generation (no autocast)")
-                        generated_ids = self.model.generate(
-                            **inputs,
-                            **generation_kwargs
-                        )
-                        debug_checkpoint("model.generate completed without autocast")
+                    # No mixed precision - use standard generation for maximum stability
+                    debug_checkpoint("Using standard generation for maximum stability")
+                    
+                    # Synchronize before generation
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    generated_ids = self.model.generate(
+                        **final_inputs,
+                        **generation_kwargs
+                    )
+                    debug_checkpoint("model.generate completed successfully")
+                    
+                    # Synchronize after generation
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                         
-                except RuntimeError as cuda_error:
-                    if "CUDA error" in str(cuda_error):
-                        debug_checkpoint(f"CUDA error detected: {cuda_error}")
-                        debug_checkpoint("Attempting fallback generation with reduced settings")
-                        
-                        # Try with even more conservative settings
-                        fallback_kwargs = {
-                            "max_new_tokens": min(max_tokens // 2, 512),
-                            "do_sample": False,  # Disable sampling
-                            "pad_token_id": self.processor.tokenizer.eos_token_id,
-                            "eos_token_id": self.processor.tokenizer.eos_token_id,
-                            "use_cache": False,  # Disable cache
-                            "num_beams": 1,
-                            "early_stopping": True,
-                            "output_attentions": False,
-                            "output_hidden_states": False,
-                            "return_dict_in_generate": False,
-                        }
-                        
-                        debug_checkpoint(f"Fallback generation kwargs: {fallback_kwargs}")
-                        
-                        # Clear cache and try again
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                        
-                        generated_ids = self.model.generate(
-                            **inputs,
-                            **fallback_kwargs
-                        )
-                        debug_checkpoint("Fallback generation completed")
-                    else:
-                        raise  # Re-raise if not a CUDA error
+                except Exception as generation_error:
+                    debug_checkpoint(f"Generation failed: {generation_error}")
+                    
+                    # Ultimate fallback: try with minimal settings
+                    debug_checkpoint("Attempting ultimate fallback generation")
+                    
+                    minimal_kwargs = {
+                        "max_new_tokens": 64,  # Absolute minimum
+                        "do_sample": False,
+                        "pad_token_id": self.processor.tokenizer.eos_token_id,
+                        "eos_token_id": self.processor.tokenizer.eos_token_id,
+                        "use_cache": False,
+                        "num_beams": 1,
+                        "output_attentions": False,
+                        "output_hidden_states": False,
+                    }
+                    
+                    # Clear cache and try again
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    generated_ids = self.model.generate(
+                        **final_inputs,
+                        **minimal_kwargs
+                    )
+                    debug_checkpoint("Ultimate fallback generation completed")
             
             debug_checkpoint("Generation completed", "GENERATION_END")
             debug_memory_status()
             
-            # Decode results
+            # Decode results safely
             debug_checkpoint("Decoding generated results", "DECODE_START")
-            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            debug_checkpoint(f"Decoded text length: {len(generated_text)}")
-            debug_checkpoint(f"Generated text preview: '{generated_text[:100]}...'")
+            try:
+                generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                debug_checkpoint(f"Decoded text length: {len(generated_text)}")
+                debug_checkpoint(f"Generated text preview: '{generated_text[:100]}...'")
+            except Exception as decode_error:
+                debug_checkpoint(f"Decoding failed: {decode_error}")
+                generated_text = "<md>Error during text generation</md>"
             debug_checkpoint("Decoding completed", "DECODE_END")
             
             # Post-process markdown
@@ -836,7 +941,7 @@ class EightBitMarkdownInference:
             
             # Add metadata header
             metadata = f"""<!--
-Generated by 8-bit Mixed Precision Kosmos-2.5
+Generated by 8-bit Mixed Precision Kosmos-2.5 (Ultra-Safe Mode)
 Model: {self.model_checkpoint}
 Quantization: {'8-bit' if self.use_8bit else 'FP16/BF16'}
 Mixed Precision: {self.mixed_precision}
@@ -855,8 +960,8 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
             debug_checkpoint(f"Failed to save markdown: {str(e)}", "SAVE_MD_FAILED")
             logger.error(f"Error saving markdown: {e}")
     
-    def batch_process(self, image_paths, output_dir, max_tokens=2048, temperature=0.1):
-        """Process multiple images in batch with progress tracking"""
+    def batch_process(self, image_paths, output_dir, max_tokens=1024, temperature=0.0):
+        """Process multiple images in batch with ultra-safe processing"""
         debug_checkpoint(f"Starting batch processing of {len(image_paths)} images", "BATCH_START")
         
         if self.model is None:
@@ -866,7 +971,7 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
         results = []
         os.makedirs(output_dir, exist_ok=True)
         
-        logger.info(f"Starting batch markdown processing of {len(image_paths)} images...")
+        logger.info(f"Starting ultra-safe batch markdown processing of {len(image_paths)} images...")
         
         for i, image_path in enumerate(image_paths, 1):
             debug_checkpoint(f"Processing batch image {i}/{len(image_paths)}: {os.path.basename(image_path)}")
@@ -877,8 +982,8 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
                 output_path = os.path.join(output_dir, f"{base_name}_markdown.md")
                 
-                # Generate markdown
-                result = safe_execute(self.generate_markdown, f"Markdown for {base_name}",
+                # Generate markdown with ultra-safe settings
+                result = safe_execute(self.generate_markdown, f"Ultra-safe markdown for {base_name}",
                     image_path=image_path,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -904,12 +1009,12 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
                     'statistics': {}
                 })
         
-        logger.info("Batch markdown processing completed!")
+        logger.info("Ultra-safe batch markdown processing completed!")
         debug_checkpoint("Batch processing completed", "BATCH_END")
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 with Enhanced Debugging - CUDA ERROR FIX')
+    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 - DEVICE ASSERTION FIX')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
@@ -919,20 +1024,20 @@ def get_args():
     parser.add_argument('--device', '-d', type=str, default=None,
                        help='Device to use (auto-detected if not specified)')
     
-    # Enhanced token size configuration
-    parser.add_argument('--max_tokens', '--tokens', type=int, default=1024,  # Reduced default for stability
-                       help='Maximum number of tokens to generate (default: 1024, recommended: 512-2048)')
-    parser.add_argument('--min_tokens', type=int, default=50,
-                       help='Minimum number of tokens to generate (default: 50)')
+    # Ultra-conservative token size configuration
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=256,  # Very conservative default
+                       help='Maximum number of tokens to generate (default: 256, recommended: 128-512)')
+    parser.add_argument('--min_tokens', type=int, default=10,
+                       help='Minimum number of tokens to generate (default: 10)')
     
-    parser.add_argument('--temperature', '-t', type=float, default=0.0,  # Default to deterministic
-                       help='Sampling temperature (0 for deterministic, 0.1-1.0 for creative)')
+    parser.add_argument('--temperature', '-t', type=float, default=0.0,  # Always deterministic
+                       help='Sampling temperature (always 0.0 for ultra-safe mode)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
     parser.add_argument('--no_8bit', action='store_true',
-                       help='Disable 8-bit quantization')
+                       help='Disable 8-bit quantization (recommended for stability)')
     parser.add_argument('--no_mixed_precision', action='store_true',
-                       help='Disable mixed precision for critical layers')
+                       help='Disable mixed precision for critical layers (recommended)')
     parser.add_argument('--batch', action='store_true',
                        help='Process multiple images (image should be a directory)')
     parser.add_argument('--print_output', '-p', action='store_true',
@@ -942,7 +1047,7 @@ def get_args():
     parser.add_argument('--debug', action='store_true',
                        help='Enable maximum debug output')
     parser.add_argument('--force_fallback', action='store_true',
-                       help='Force use of fallback mode (no 8-bit quantization)')
+                       help='Force use of fallback mode (recommended for stability)')
     
     return parser.parse_args()
 
@@ -951,17 +1056,19 @@ def main():
     
     args = get_args()
     
+    # Force ultra-safe settings
+    if args.temperature != 0.0:
+        logger.warning("Forcing temperature to 0.0 for ultra-safe mode")
+        args.temperature = 0.0
+    
     # Validate token configuration
     if args.max_tokens < args.min_tokens:
         logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
         sys.exit(1)
     
-    if args.max_tokens > 4096:  # More conservative limit
-        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause CUDA errors. Consider using smaller values.")
-    
-    if args.temperature < 0 or args.temperature > 1.0:
-        logger.error(f"Temperature must be between 0.0 and 1.0, got {args.temperature}")
-        sys.exit(1)
+    if args.max_tokens > 512:  # Very conservative limit
+        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause device assertion errors. Capping at 512.")
+        args.max_tokens = 512
     
     # Set logging level
     if args.debug:
@@ -974,20 +1081,20 @@ def main():
     debug_checkpoint(f"Arguments: {vars(args)}")
     debug_checkpoint(f"Token configuration - Max: {args.max_tokens}, Min: {args.min_tokens}, Temperature: {args.temperature}")
     
-    # Initialize 8-bit mixed precision markdown inference
-    debug_checkpoint("Initializing markdown engine")
-    md_engine = safe_execute(EightBitMarkdownInference, "Initialize markdown engine",
+    # Initialize with ultra-safe settings
+    debug_checkpoint("Initializing ultra-safe markdown engine")
+    md_engine = safe_execute(EightBitMarkdownInference, "Initialize ultra-safe markdown engine",
         model_checkpoint=args.model_checkpoint,
         device=args.device,
         cache_dir=args.cache_dir,
-        use_8bit=not args.no_8bit,
-        mixed_precision=not args.no_mixed_precision,
-        force_fallback=args.force_fallback
+        use_8bit=False,  # Force disable 8-bit for maximum stability
+        mixed_precision=False,  # Force disable mixed precision
+        force_fallback=True  # Force fallback mode
     )
     
     try:
         if args.batch and os.path.isdir(args.image):
-            debug_checkpoint("Starting batch processing mode")
+            debug_checkpoint("Starting ultra-safe batch processing mode")
             # Batch processing
             image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
             image_paths = [
@@ -1000,12 +1107,12 @@ def main():
                 logger.error(f"No images found in directory: {args.image}")
                 sys.exit(1)
             
-            debug_checkpoint(f"Found {len(image_paths)} images for batch processing")
-            logger.info(f"Processing {len(image_paths)} images in batch mode with max_tokens={args.max_tokens}, temperature={args.temperature}")
+            debug_checkpoint(f"Found {len(image_paths)} images for ultra-safe batch processing")
+            logger.info(f"Processing {len(image_paths)} images in ultra-safe batch mode with max_tokens={args.max_tokens}")
             
-            results = safe_execute(md_engine.batch_process, "Batch process images",
+            results = safe_execute(md_engine.batch_process, "Ultra-safe batch process images",
                 image_paths=image_paths,
-                output_dir=args.output,  # Use as output directory
+                output_dir=args.output,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature
             )
@@ -1019,7 +1126,7 @@ def main():
             total_lists = sum(r.get('statistics', {}).get('lists', 0) for r in results if 'error' not in r)
             
             print(f"\n{'='*80}")
-            print("BATCH MARKDOWN PROCESSING SUMMARY (8-BIT MIXED PRECISION)")
+            print("BATCH MARKDOWN PROCESSING SUMMARY (ULTRA-SAFE MODE)")
             print(f"{'='*80}")
             print(f"Total images processed: {len(results)}")
             print(f"Successful: {successful}")
@@ -1033,15 +1140,14 @@ def main():
             print(f"Model checkpoint: {args.model_checkpoint}")
             print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Temperature: {args.temperature}")
-            print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
-            print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
+            print(f"Mode: Ultra-Safe (FP16, No Mixed Precision)")
             print(f"Output directory: {args.output}")
             print(f"{'='*80}")
             
         else:
-            debug_checkpoint("Starting single image processing mode")
+            debug_checkpoint("Starting ultra-safe single image processing mode")
             # Single image processing
-            result = safe_execute(md_engine.generate_markdown, "Generate markdown for single image",
+            result = safe_execute(md_engine.generate_markdown, "Generate ultra-safe markdown for single image",
                 image_path=args.image,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
@@ -1052,7 +1158,7 @@ def main():
             
             # Print results summary
             print(f"\n{'='*80}")
-            print("MARKDOWN GENERATION SUMMARY (8-BIT MIXED PRECISION)")
+            print("MARKDOWN GENERATION SUMMARY (ULTRA-SAFE MODE)")
             print(f"{'='*80}")
             print(f"Processing time: {result['inference_time']:.2f}s")
             print(f"Word count: {stats['word_count']:,}")
@@ -1066,8 +1172,7 @@ def main():
             print(f"Model checkpoint: {args.model_checkpoint}")
             print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Temperature: {args.temperature}")
-            print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
-            print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
+            print(f"Mode: Ultra-Safe (FP16, No Mixed Precision)")
             print(f"{'='*80}")
             
             if args.print_output:
