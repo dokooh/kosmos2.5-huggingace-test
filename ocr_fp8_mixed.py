@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-8-bit Mixed Precision OCR Inference for Kosmos-2.5 with Enhanced Debugging
+8-bit Mixed Precision OCR Inference for Kosmos-2.5 with Enhanced Debugging - FIXED
 
 This module provides fast OCR inference using 8-bit mixed precision quantized Kosmos-2.5 model.
 Features:
@@ -13,6 +13,7 @@ Features:
 - Batch processing support with progress tracking
 - Comprehensive error handling and fallback mechanisms
 - EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
+- FIXED: Tensor formatting and traceback namespace issues
 """
 
 import re
@@ -22,7 +23,7 @@ import argparse
 import sys
 import os
 import time
-import traceback
+import traceback as tb_module  # Avoid namespace conflict
 from PIL import Image, ImageDraw, ImageFont
 from transformers import (
     AutoProcessor, 
@@ -74,8 +75,14 @@ def safe_execute(func, description, *args, **kwargs):
         return result
     except Exception as e:
         debug_checkpoint(f"FAILED: {description} - Error: {str(e)}")
-        logger.error(f"Exception in {description}: {traceback.format_exc()}")
+        logger.error(f"Exception in {description}: {tb_module.format_exc()}")
         raise
+
+def tensor_to_float(tensor_val):
+    """Safely convert tensor to float for formatting"""
+    if isinstance(tensor_val, torch.Tensor):
+        return float(tensor_val.item())
+    return float(tensor_val)
 
 class EightBitOCRInference:
     def __init__(self, model_checkpoint, device=None, cache_dir=None, use_8bit=True, mixed_precision=True):
@@ -391,7 +398,7 @@ class EightBitOCRInference:
         except Exception as e:
             debug_checkpoint(f"Model loading failed with error: {str(e)}", "LOAD_MODEL_FAILED")
             logger.error(f"Failed to load model: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Full traceback: {tb_module.format_exc()}")
             
             # Fallback to basic loading
             debug_checkpoint("Attempting fallback model loading", "FALLBACK_START")
@@ -437,7 +444,7 @@ class EightBitOCRInference:
             except Exception as e2:
                 debug_checkpoint(f"Fallback loading also failed: {str(e2)}", "FALLBACK_FAILED")
                 logger.error(f"Fallback loading also failed: {e2}")
-                logger.error(f"Fallback traceback: {traceback.format_exc()}")
+                logger.error(f"Fallback traceback: {tb_module.format_exc()}")
                 raise
     
     def load_image(self, image_path):
@@ -711,13 +718,19 @@ class EightBitOCRInference:
             inputs = self.processor(text=prompt, images=image, return_tensors="pt")
             debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
             
-            # Extract scaling information
+            # Extract scaling information - FIXED: Convert tensors to float properly
             height = inputs.pop("height")
             width = inputs.pop("width")
             raw_width, raw_height = image.size
-            scale_height = raw_height / height
-            scale_width = raw_width / width
-            debug_checkpoint(f"Image scaling - Raw: {raw_width}x{raw_height}, Processed: {width}x{height}")
+            
+            # Convert tensor values to float for calculations
+            height_val = tensor_to_float(height)
+            width_val = tensor_to_float(width)
+            
+            scale_height = raw_height / height_val
+            scale_width = raw_width / width_val
+            
+            debug_checkpoint(f"Image scaling - Raw: {raw_width}x{raw_height}, Processed: {width_val}x{height_val}")
             debug_checkpoint(f"Scale factors - Height: {scale_height:.3f}, Width: {scale_width:.3f}")
             debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
             
@@ -832,7 +845,7 @@ class EightBitOCRInference:
         except Exception as e:
             debug_checkpoint(f"OCR inference failed with error: {str(e)}", "OCR_FAILED")
             logger.error(f"Error during OCR inference: {e}")
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Full traceback: {tb_module.format_exc()}")
             raise
     
     def save_text_results(self, ocr_results, output_path):
@@ -937,7 +950,7 @@ class EightBitOCRInference:
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision OCR inference using Kosmos-2.5 with Enhanced Debugging')
+    parser = argparse.ArgumentParser(description='8-bit Mixed Precision OCR inference using Kosmos-2.5 with Enhanced Debugging - FIXED')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
@@ -1085,7 +1098,7 @@ def main():
         debug_checkpoint(f"Application failed with error: {str(e)}", "MAIN_FAILED")
         logger.error(f"OCR inference failed: {e}")
         if args.verbose or args.debug:
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+            logger.error(f"Full traceback: {tb_module.format_exc()}")
             import traceback
             traceback.print_exc()
         sys.exit(1)
