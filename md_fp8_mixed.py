@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # filepath: c:\SAI\IA\unilm\kosmos-2.5\md_fp8_mixed.py
 """
-8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - DEVICE ASSERTION FIX
+8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - DTYPE MISMATCH FIX
 
 This module provides fast markdown generation using 8-bit mixed precision quantized Kosmos-2.5 model.
 Features:
@@ -14,7 +14,7 @@ Features:
 - Batch processing support with progress tracking
 - Comprehensive error handling and fallback mechanisms
 - EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
-- DEVICE ASSERTION FIX: Ultra-conservative tensor validation and device placement
+- DTYPE MISMATCH FIX: Ensures consistent tensor dtypes throughout processing
 """
 
 import torch
@@ -118,9 +118,21 @@ def debug_tensor_detailed(tensor, name):
     except Exception as e:
         debug_checkpoint(f"Error in detailed tensor analysis for {name}: {e}")
 
-def ultra_safe_tensor_validation(tensor_dict):
-    """Ultra-safe tensor validation with comprehensive fixing"""
-    debug_checkpoint("Starting ultra-safe tensor validation", "ULTRA_SAFE_START")
+def get_model_dtype(model):
+    """Get the primary dtype of the model"""
+    try:
+        # Get dtype from the first parameter
+        first_param = next(model.parameters())
+        model_dtype = first_param.dtype
+        debug_checkpoint(f"Model primary dtype: {model_dtype}")
+        return model_dtype
+    except Exception as e:
+        debug_checkpoint(f"Failed to get model dtype: {e}")
+        return torch.float32
+
+def ultra_safe_tensor_validation_with_dtype(tensor_dict, target_dtype):
+    """Ultra-safe tensor validation with consistent dtype conversion"""
+    debug_checkpoint(f"Starting ultra-safe tensor validation with target dtype: {target_dtype}", "ULTRA_SAFE_DTYPE_START")
     
     fixed_tensors = {}
     
@@ -147,7 +159,7 @@ def ultra_safe_tensor_validation(tensor_dict):
                     debug_checkpoint(f"Processing attention mask: {key}")
                     # Ensure attention mask only has 0 and 1 values
                     fixed_tensor = torch.clamp(fixed_tensor, 0, 1)
-                    # Convert to long/int64 for attention masks
+                    # Convert to long/int64 for attention masks (keep as integer type)
                     if fixed_tensor.dtype != torch.long:
                         fixed_tensor = fixed_tensor.long()
                     debug_checkpoint(f"Attention mask {key} validated and converted to long")
@@ -156,7 +168,7 @@ def ultra_safe_tensor_validation(tensor_dict):
                     debug_checkpoint(f"Processing input_ids: {key}")
                     # Ensure input_ids are non-negative and within reasonable range
                     fixed_tensor = torch.clamp(fixed_tensor, min=0, max=250000)
-                    # Ensure input_ids are long
+                    # Ensure input_ids are long (keep as integer type)
                     if fixed_tensor.dtype != torch.long:
                         fixed_tensor = fixed_tensor.long()
                     debug_checkpoint(f"Input_ids {key} validated and clamped")
@@ -164,8 +176,13 @@ def ultra_safe_tensor_validation(tensor_dict):
                 elif 'pixel_values' in key.lower():
                     debug_checkpoint(f"Processing pixel values: {key}")
                     # Ensure pixel values are in reasonable range
-                    fixed_tensor = torch.clamp(fixed_tensor, -10.0, 10.0)  # Conservative range for normalized pixels
-                    debug_checkpoint(f"Pixel values {key} clamped to safe range")
+                    fixed_tensor = torch.clamp(fixed_tensor, -10.0, 10.0)
+                    # Convert pixel values to target dtype (float type)
+                    if target_dtype in [torch.float16, torch.bfloat16, torch.float32]:
+                        if fixed_tensor.dtype != target_dtype:
+                            debug_checkpoint(f"Converting pixel values from {fixed_tensor.dtype} to {target_dtype}")
+                            fixed_tensor = fixed_tensor.to(dtype=target_dtype)
+                    debug_checkpoint(f"Pixel values {key} clamped and converted to {fixed_tensor.dtype}")
                 
                 elif 'position' in key.lower():
                     debug_checkpoint(f"Processing position tensor: {key}")
@@ -175,6 +192,13 @@ def ultra_safe_tensor_validation(tensor_dict):
                         fixed_tensor = fixed_tensor.long()
                     debug_checkpoint(f"Position tensor {key} validated")
                 
+                else:
+                    # For other float tensors, convert to target dtype
+                    if fixed_tensor.dtype.is_floating_point and target_dtype.is_floating_point:
+                        if fixed_tensor.dtype != target_dtype:
+                            debug_checkpoint(f"Converting {key} from {fixed_tensor.dtype} to {target_dtype}")
+                            fixed_tensor = fixed_tensor.to(dtype=target_dtype)
+                
                 # Step 3: Final validation
                 debug_tensor_detailed(fixed_tensor, f"{key}_fixed")
                 
@@ -182,11 +206,16 @@ def ultra_safe_tensor_validation(tensor_dict):
                 if torch.isnan(fixed_tensor).any() or torch.isinf(fixed_tensor).any():
                     debug_checkpoint(f"CRITICAL: Tensor {key} still has invalid values after fixing!")
                     # Last resort: replace with zeros if still problematic
-                    fixed_tensor = torch.zeros_like(fixed_tensor)
-                    debug_checkpoint(f"Replaced {key} with zeros as last resort")
+                    if 'attention_mask' in key.lower():
+                        fixed_tensor = torch.ones_like(fixed_tensor, dtype=torch.long)
+                    elif 'input_ids' in key.lower():
+                        fixed_tensor = torch.zeros_like(fixed_tensor, dtype=torch.long)
+                    else:
+                        fixed_tensor = torch.zeros_like(fixed_tensor, dtype=target_dtype)
+                    debug_checkpoint(f"Replaced {key} with safe values as last resort")
                 
                 fixed_tensors[key] = fixed_tensor
-                debug_checkpoint(f"Tensor {key} validation completed successfully")
+                debug_checkpoint(f"Tensor {key} validation completed successfully - Final dtype: {fixed_tensor.dtype}")
                 
             except Exception as e:
                 debug_checkpoint(f"Error fixing tensor {key}: {e}")
@@ -203,8 +232,8 @@ def ultra_safe_tensor_validation(tensor_dict):
                         fixed_tensors[key] = torch.zeros(safe_shape, dtype=torch.long, device='cpu')
                         debug_checkpoint(f"Created fallback input_ids for {key}")
                     else:
-                        # For other tensors, create zeros
-                        fixed_tensors[key] = torch.zeros_like(tensor, device='cpu')
+                        # For other tensors, create zeros with target dtype
+                        fixed_tensors[key] = torch.zeros_like(tensor, dtype=target_dtype, device='cpu')
                         debug_checkpoint(f"Created fallback zeros tensor for {key}")
                 except Exception as fallback_error:
                     debug_checkpoint(f"Even fallback creation failed for {key}: {fallback_error}")
@@ -213,12 +242,12 @@ def ultra_safe_tensor_validation(tensor_dict):
         else:
             fixed_tensors[key] = tensor
     
-    debug_checkpoint("Ultra-safe tensor validation completed", "ULTRA_SAFE_END")
+    debug_checkpoint("Ultra-safe tensor validation with dtype completed", "ULTRA_SAFE_DTYPE_END")
     return fixed_tensors
 
-def ultra_safe_device_move(tensor_dict, target_device):
-    """Ultra-safe device movement with extensive error handling"""
-    debug_checkpoint(f"Starting ultra-safe device move to {target_device}", "DEVICE_MOVE_START")
+def ultra_safe_device_move_with_dtype(tensor_dict, target_device, target_dtype):
+    """Ultra-safe device movement with dtype consistency"""
+    debug_checkpoint(f"Starting ultra-safe device move to {target_device} with dtype {target_dtype}", "DEVICE_MOVE_DTYPE_START")
     
     # Parse target device
     if isinstance(target_device, torch.device):
@@ -230,7 +259,7 @@ def ultra_safe_device_move(tensor_dict, target_device):
     
     for key, tensor in tensor_dict.items():
         if isinstance(tensor, torch.Tensor):
-            debug_checkpoint(f"Moving tensor {key} to device {target_device_str}")
+            debug_checkpoint(f"Moving tensor {key} to device {target_device_str} with dtype consistency")
             
             try:
                 # First, ensure tensor is on CPU for safe transfer
@@ -245,6 +274,12 @@ def ultra_safe_device_move(tensor_dict, target_device):
                 if torch.isnan(cpu_tensor).any() or torch.isinf(cpu_tensor).any():
                     debug_checkpoint(f"CRITICAL: Tensor {key} has invalid values on CPU!")
                     raise ValueError(f"Invalid values in tensor {key}")
+                
+                # Apply dtype conversion if needed (only for floating point tensors)
+                if cpu_tensor.dtype.is_floating_point and target_dtype.is_floating_point:
+                    if cpu_tensor.dtype != target_dtype:
+                        debug_checkpoint(f"Converting {key} from {cpu_tensor.dtype} to {target_dtype}")
+                        cpu_tensor = cpu_tensor.to(dtype=target_dtype)
                 
                 # Move to target device with explicit error handling
                 if target_device_str.startswith('cuda'):
@@ -263,11 +298,11 @@ def ultra_safe_device_move(tensor_dict, target_device):
                     if device_moved[key].device.type != 'cuda':
                         raise RuntimeError(f"Failed to move {key} to CUDA")
                     
-                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device}")
+                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device} with dtype {device_moved[key].dtype}")
                 else:
                     # Moving to CPU or other device
                     device_moved[key] = cpu_tensor.to(device=target_device_str)
-                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device}")
+                    debug_checkpoint(f"Successfully moved {key} to {device_moved[key].device} with dtype {device_moved[key].dtype}")
                 
             except Exception as e:
                 debug_checkpoint(f"Failed to move tensor {key} to {target_device_str}: {e}")
@@ -279,7 +314,14 @@ def ultra_safe_device_move(tensor_dict, target_device):
                     # Strategy 1: Keep on CPU if CUDA move fails
                     if target_device_str.startswith('cuda'):
                         debug_checkpoint(f"Keeping {key} on CPU as fallback")
-                        device_moved[key] = tensor.cpu()
+                        # Apply dtype conversion even for CPU fallback
+                        if tensor.dtype.is_floating_point and target_dtype.is_floating_point:
+                            if tensor.dtype != target_dtype:
+                                device_moved[key] = tensor.cpu().to(dtype=target_dtype)
+                            else:
+                                device_moved[key] = tensor.cpu()
+                        else:
+                            device_moved[key] = tensor.cpu()
                     else:
                         # For non-CUDA targets, try direct move
                         device_moved[key] = tensor.to(device=target_device_str)
@@ -296,8 +338,8 @@ def ultra_safe_device_move(tensor_dict, target_device):
                         elif 'input_ids' in key.lower():
                             device_moved[key] = torch.zeros_like(tensor, device='cpu', dtype=torch.long)
                         else:
-                            device_moved[key] = torch.zeros_like(tensor, device='cpu')
-                        debug_checkpoint(f"Created replacement tensor for {key} on CPU")
+                            device_moved[key] = torch.zeros_like(tensor, device='cpu', dtype=target_dtype)
+                        debug_checkpoint(f"Created replacement tensor for {key} on CPU with correct dtype")
                     except Exception as replacement_error:
                         debug_checkpoint(f"Even replacement tensor creation failed for {key}: {replacement_error}")
                         # Skip this tensor
@@ -305,7 +347,7 @@ def ultra_safe_device_move(tensor_dict, target_device):
         else:
             device_moved[key] = tensor
     
-    debug_checkpoint("Ultra-safe device move completed", "DEVICE_MOVE_END")
+    debug_checkpoint("Ultra-safe device move with dtype completed", "DEVICE_MOVE_DTYPE_END")
     return device_moved
 
 def safe_execute(func, description, *args, **kwargs):
@@ -358,6 +400,7 @@ class EightBitMarkdownInference:
         self.force_fallback = force_fallback
         self.model = None
         self.processor = None
+        self.model_dtype = None  # Will be set after model loading
         
         debug_checkpoint(f"Parameters - Model: {model_checkpoint}, Device: {self.device}, 8bit: {self.use_8bit}")
         
@@ -399,11 +442,11 @@ class EightBitMarkdownInference:
         else:
             debug_checkpoint("Setting up non-8bit precision")
             self.quantization_config = None
-            # Use float16 for maximum compatibility
+            # Use float32 for maximum compatibility and to avoid dtype mismatches
             if self.device.startswith('cuda'):
-                self.dtype = torch.float16  # Use float16 instead of bfloat16 for better compatibility
-                logger.info("Using float16 for better compatibility")
-                debug_checkpoint("Set dtype to float16")
+                self.dtype = torch.float32  # Use float32 for maximum compatibility
+                logger.info("Using float32 for maximum compatibility")
+                debug_checkpoint("Set dtype to float32")
             else:
                 self.dtype = torch.float32
                 logger.info("Using float32 for CPU")
@@ -454,7 +497,7 @@ class EightBitMarkdownInference:
             debug_checkpoint("Model already loaded, skipping")
             return
             
-        logger.info("Loading Kosmos-2.5 model with 8-bit mixed precision...")
+        logger.info("Loading Kosmos-2.5 model with dtype consistency...")
         debug_memory_status()
         
         # Validate local checkpoint if specified
@@ -474,6 +517,10 @@ class EightBitMarkdownInference:
             logger.error(f"Model loading failed: {e}")
             raise
         
+        # Get model dtype after loading
+        self.model_dtype = get_model_dtype(self.model)
+        debug_checkpoint(f"Model loaded with dtype: {self.model_dtype}")
+        
         # Common post-loading setup
         self._post_loading_setup()
         
@@ -487,7 +534,7 @@ class EightBitMarkdownInference:
         self.use_8bit = False
         
         fallback_kwargs = {
-            "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+            "torch_dtype": self.dtype,  # Use consistent dtype
             "cache_dir": self.cache_dir,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
@@ -512,24 +559,23 @@ class EightBitMarkdownInference:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 
-                # Move model
-                self.model = self.model.to(self.device)
-                
-                # Apply half precision if needed
-                if self.dtype == torch.float16:
-                    self.model = self.model.half()
+                # Move model to device with consistent dtype
+                self.model = self.model.to(device=self.device, dtype=self.dtype)
                 
                 # Synchronize after move
                 torch.cuda.synchronize()
-                debug_checkpoint("Model successfully moved to GPU")
+                debug_checkpoint("Model successfully moved to GPU with consistent dtype")
                 
             except Exception as e:
                 debug_checkpoint(f"Failed to move model to GPU: {e}")
                 logger.warning(f"Keeping model on CPU due to GPU move failure: {e}")
                 self.device = "cpu"
-                self.model = self.model.cpu().float()
+                self.model = self.model.to(device="cpu", dtype=self.dtype)
+        else:
+            # For CPU, ensure consistent dtype
+            self.model = self.model.to(dtype=self.dtype)
         
-        debug_checkpoint("Fallback model loaded", "FALLBACK_LOAD_END")
+        debug_checkpoint("Fallback model loaded with consistent dtype", "FALLBACK_LOAD_END")
     
     def _post_loading_setup(self):
         """Common setup after model loading"""
@@ -569,10 +615,10 @@ class EightBitMarkdownInference:
             self.model.eval()
             debug_checkpoint("Model set to eval mode")
         
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            debug_checkpoint("Enabled gradient checkpointing")
+        # Disable gradient checkpointing to avoid dtype issues
+        # if hasattr(self.model, 'gradient_checkpointing_enable'):
+        #     self.model.gradient_checkpointing_enable()
+        #     debug_checkpoint("Enabled gradient checkpointing")
         
         debug_checkpoint("Post-loading setup completed", "POSTLOAD_END")
     
@@ -720,8 +766,8 @@ class EightBitMarkdownInference:
         return text
     
     def generate_markdown(self, image_path, max_tokens=1024, temperature=0.0, save_output=None):
-        """Generate markdown from image using ultra-safe processing to avoid device assertion errors"""
-        debug_checkpoint("Starting markdown generation", "MD_START")
+        """Generate markdown from image with dtype consistency to fix float/half mismatch"""
+        debug_checkpoint("Starting markdown generation with dtype consistency", "MD_START")
         
         if self.model is None:
             debug_checkpoint("Model not loaded, loading now")
@@ -756,15 +802,19 @@ class EightBitMarkdownInference:
             
             debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
             
-            # ULTRA-SAFE TENSOR VALIDATION AND DEVICE PLACEMENT
-            debug_checkpoint("Starting ultra-safe tensor validation", "ULTRA_SAFE_START")
+            # DTYPE-CONSISTENT TENSOR VALIDATION AND DEVICE PLACEMENT
+            debug_checkpoint("Starting dtype-consistent tensor validation", "DTYPE_CONSISTENT_START")
             debug_memory_status()
             
-            # Step 1: Ultra-safe tensor validation on CPU
-            validated_inputs = ultra_safe_tensor_validation(inputs)
-            debug_checkpoint("Tensor validation completed")
+            # Step 1: Get model dtype for consistency
+            model_dtype = self.model_dtype or get_model_dtype(self.model)
+            debug_checkpoint(f"Using model dtype: {model_dtype} for consistency")
             
-            # Step 2: Get model device safely
+            # Step 2: Ultra-safe tensor validation with target dtype
+            validated_inputs = ultra_safe_tensor_validation_with_dtype(inputs, model_dtype)
+            debug_checkpoint("Tensor validation with dtype completed")
+            
+            # Step 3: Get model device safely
             try:
                 model_device = next(self.model.parameters()).device
                 debug_checkpoint(f"Model is on device: {model_device}")
@@ -773,18 +823,24 @@ class EightBitMarkdownInference:
                 model_device = torch.device('cpu')
                 debug_checkpoint("Defaulting to CPU")
             
-            # Step 3: Ultra-safe device movement
+            # Step 4: Ultra-safe device movement with dtype consistency
             if str(model_device) != 'cpu':
-                final_inputs = ultra_safe_device_move(validated_inputs, model_device)
+                final_inputs = ultra_safe_device_move_with_dtype(validated_inputs, model_device, model_dtype)
             else:
                 final_inputs = validated_inputs
             
-            debug_checkpoint("Ultra-safe processing completed", "ULTRA_SAFE_END")
+            debug_checkpoint("Dtype-consistent processing completed", "DTYPE_CONSISTENT_END")
             debug_memory_status()
+            
+            # Final dtype verification
+            debug_checkpoint("Final dtype verification before generation:")
+            for key, tensor in final_inputs.items():
+                if isinstance(tensor, torch.Tensor):
+                    debug_checkpoint(f"  {key}: {tensor.dtype} on {tensor.device}")
             
             # Generate markdown with ultra-conservative settings
             debug_checkpoint("Starting ultra-conservative generation", "GENERATION_START")
-            logger.info("Generating markdown with ultra-conservative settings...")
+            logger.info("Generating markdown with dtype consistency...")
             
             with torch.no_grad():
                 debug_checkpoint("Entered torch.no_grad() context")
@@ -838,7 +894,7 @@ class EightBitMarkdownInference:
                     debug_checkpoint("Attempting ultimate fallback generation")
                     
                     minimal_kwargs = {
-                        "max_new_tokens": 64,  # Absolute minimum
+                        "max_new_tokens": 32,  # Even smaller for maximum stability
                         "do_sample": False,
                         "pad_token_id": self.processor.tokenizer.eos_token_id,
                         "eos_token_id": self.processor.tokenizer.eos_token_id,
@@ -941,9 +997,9 @@ class EightBitMarkdownInference:
             
             # Add metadata header
             metadata = f"""<!--
-Generated by 8-bit Mixed Precision Kosmos-2.5 (Ultra-Safe Mode)
+Generated by 8-bit Mixed Precision Kosmos-2.5 (Dtype-Consistent Mode)
 Model: {self.model_checkpoint}
-Quantization: {'8-bit' if self.use_8bit else 'FP16/BF16'}
+Quantization: {'8-bit' if self.use_8bit else self.dtype}
 Mixed Precision: {self.mixed_precision}
 Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
 -->
@@ -961,7 +1017,7 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
             logger.error(f"Error saving markdown: {e}")
     
     def batch_process(self, image_paths, output_dir, max_tokens=1024, temperature=0.0):
-        """Process multiple images in batch with ultra-safe processing"""
+        """Process multiple images in batch with dtype consistency"""
         debug_checkpoint(f"Starting batch processing of {len(image_paths)} images", "BATCH_START")
         
         if self.model is None:
@@ -971,7 +1027,7 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
         results = []
         os.makedirs(output_dir, exist_ok=True)
         
-        logger.info(f"Starting ultra-safe batch markdown processing of {len(image_paths)} images...")
+        logger.info(f"Starting dtype-consistent batch markdown processing of {len(image_paths)} images...")
         
         for i, image_path in enumerate(image_paths, 1):
             debug_checkpoint(f"Processing batch image {i}/{len(image_paths)}: {os.path.basename(image_path)}")
@@ -982,8 +1038,8 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
                 output_path = os.path.join(output_dir, f"{base_name}_markdown.md")
                 
-                # Generate markdown with ultra-safe settings
-                result = safe_execute(self.generate_markdown, f"Ultra-safe markdown for {base_name}",
+                # Generate markdown with dtype-consistent settings
+                result = safe_execute(self.generate_markdown, f"Dtype-consistent markdown for {base_name}",
                     image_path=image_path,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -1009,12 +1065,12 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
                     'statistics': {}
                 })
         
-        logger.info("Ultra-safe batch markdown processing completed!")
+        logger.info("Dtype-consistent batch markdown processing completed!")
         debug_checkpoint("Batch processing completed", "BATCH_END")
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 - DEVICE ASSERTION FIX')
+    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 - DTYPE MISMATCH FIX')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
@@ -1024,14 +1080,14 @@ def get_args():
     parser.add_argument('--device', '-d', type=str, default=None,
                        help='Device to use (auto-detected if not specified)')
     
-    # Ultra-conservative token size configuration
-    parser.add_argument('--max_tokens', '--tokens', type=int, default=256,  # Very conservative default
+    # Conservative token size configuration
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=256,  # Conservative default
                        help='Maximum number of tokens to generate (default: 256, recommended: 128-512)')
     parser.add_argument('--min_tokens', type=int, default=10,
                        help='Minimum number of tokens to generate (default: 10)')
     
     parser.add_argument('--temperature', '-t', type=float, default=0.0,  # Always deterministic
-                       help='Sampling temperature (always 0.0 for ultra-safe mode)')
+                       help='Sampling temperature (always 0.0 for stable mode)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
     parser.add_argument('--no_8bit', action='store_true',
@@ -1056,9 +1112,9 @@ def main():
     
     args = get_args()
     
-    # Force ultra-safe settings
+    # Force stable settings
     if args.temperature != 0.0:
-        logger.warning("Forcing temperature to 0.0 for ultra-safe mode")
+        logger.warning("Forcing temperature to 0.0 for stable mode")
         args.temperature = 0.0
     
     # Validate token configuration
@@ -1066,8 +1122,8 @@ def main():
         logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
         sys.exit(1)
     
-    if args.max_tokens > 512:  # Very conservative limit
-        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause device assertion errors. Capping at 512.")
+    if args.max_tokens > 512:  # Conservative limit
+        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause dtype issues. Capping at 512.")
         args.max_tokens = 512
     
     # Set logging level
@@ -1081,20 +1137,20 @@ def main():
     debug_checkpoint(f"Arguments: {vars(args)}")
     debug_checkpoint(f"Token configuration - Max: {args.max_tokens}, Min: {args.min_tokens}, Temperature: {args.temperature}")
     
-    # Initialize with ultra-safe settings
-    debug_checkpoint("Initializing ultra-safe markdown engine")
-    md_engine = safe_execute(EightBitMarkdownInference, "Initialize ultra-safe markdown engine",
+    # Initialize with dtype-consistent settings
+    debug_checkpoint("Initializing dtype-consistent markdown engine")
+    md_engine = safe_execute(EightBitMarkdownInference, "Initialize dtype-consistent markdown engine",
         model_checkpoint=args.model_checkpoint,
         device=args.device,
         cache_dir=args.cache_dir,
-        use_8bit=False,  # Force disable 8-bit for maximum stability
+        use_8bit=False,  # Force disable 8-bit for maximum dtype consistency
         mixed_precision=False,  # Force disable mixed precision
         force_fallback=True  # Force fallback mode
     )
     
     try:
         if args.batch and os.path.isdir(args.image):
-            debug_checkpoint("Starting ultra-safe batch processing mode")
+            debug_checkpoint("Starting dtype-consistent batch processing mode")
             # Batch processing
             image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
             image_paths = [
@@ -1107,10 +1163,10 @@ def main():
                 logger.error(f"No images found in directory: {args.image}")
                 sys.exit(1)
             
-            debug_checkpoint(f"Found {len(image_paths)} images for ultra-safe batch processing")
-            logger.info(f"Processing {len(image_paths)} images in ultra-safe batch mode with max_tokens={args.max_tokens}")
+            debug_checkpoint(f"Found {len(image_paths)} images for dtype-consistent batch processing")
+            logger.info(f"Processing {len(image_paths)} images in dtype-consistent batch mode with max_tokens={args.max_tokens}")
             
-            results = safe_execute(md_engine.batch_process, "Ultra-safe batch process images",
+            results = safe_execute(md_engine.batch_process, "Dtype-consistent batch process images",
                 image_paths=image_paths,
                 output_dir=args.output,
                 max_tokens=args.max_tokens,
@@ -1126,7 +1182,7 @@ def main():
             total_lists = sum(r.get('statistics', {}).get('lists', 0) for r in results if 'error' not in r)
             
             print(f"\n{'='*80}")
-            print("BATCH MARKDOWN PROCESSING SUMMARY (ULTRA-SAFE MODE)")
+            print("BATCH MARKDOWN PROCESSING SUMMARY (DTYPE-CONSISTENT MODE)")
             print(f"{'='*80}")
             print(f"Total images processed: {len(results)}")
             print(f"Successful: {successful}")
@@ -1140,14 +1196,14 @@ def main():
             print(f"Model checkpoint: {args.model_checkpoint}")
             print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Temperature: {args.temperature}")
-            print(f"Mode: Ultra-Safe (FP16, No Mixed Precision)")
+            print(f"Mode: Dtype-Consistent (Float32)")
             print(f"Output directory: {args.output}")
             print(f"{'='*80}")
             
         else:
-            debug_checkpoint("Starting ultra-safe single image processing mode")
+            debug_checkpoint("Starting dtype-consistent single image processing mode")
             # Single image processing
-            result = safe_execute(md_engine.generate_markdown, "Generate ultra-safe markdown for single image",
+            result = safe_execute(md_engine.generate_markdown, "Generate dtype-consistent markdown for single image",
                 image_path=args.image,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
@@ -1158,7 +1214,7 @@ def main():
             
             # Print results summary
             print(f"\n{'='*80}")
-            print("MARKDOWN GENERATION SUMMARY (ULTRA-SAFE MODE)")
+            print("MARKDOWN GENERATION SUMMARY (DTYPE-CONSISTENT MODE)")
             print(f"{'='*80}")
             print(f"Processing time: {result['inference_time']:.2f}s")
             print(f"Word count: {stats['word_count']:,}")
@@ -1172,7 +1228,7 @@ def main():
             print(f"Model checkpoint: {args.model_checkpoint}")
             print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
             print(f"Temperature: {args.temperature}")
-            print(f"Mode: Ultra-Safe (FP16, No Mixed Precision)")
+            print(f"Mode: Dtype-Consistent (Float32)")
             print(f"{'='*80}")
             
             if args.print_output:
