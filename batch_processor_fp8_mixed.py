@@ -431,7 +431,8 @@ class EightBitBatchProcessor:
                                output_folders: Dict[str, str],
                                process_ocr: bool,
                                process_md: bool,
-                               max_tokens: int,
+                               ocr_max_tokens: int,
+                               md_max_tokens: int,
                                temperature: float) -> Dict[str, Any]:
         """Process images sequentially with detailed progress tracking"""
         debug_checkpoint("Starting sequential batch processing", "BATCH_SEQ_START")
@@ -455,7 +456,7 @@ class EightBitBatchProcessor:
             if process_ocr:
                 debug_checkpoint(f"Processing OCR for image {i}: {image_name}")
                 ocr_result = self.process_single_image_ocr(
-                    image_path, output_folders, max_tokens, task_id=i
+                    image_path, output_folders, ocr_max_tokens, task_id=i
                 )
                 results['ocr_results'].append(ocr_result)
                 self.completed_tasks += 1
@@ -468,7 +469,7 @@ class EightBitBatchProcessor:
             if process_md:
                 debug_checkpoint(f"Processing Markdown for image {i}: {image_name}")
                 md_result = self.process_single_image_markdown(
-                    image_path, output_folders, max_tokens, temperature, task_id=i
+                    image_path, output_folders, md_max_tokens, temperature, task_id=i
                 )
                 results['md_results'].append(md_result)
                 self.completed_tasks += 1
@@ -488,7 +489,8 @@ class EightBitBatchProcessor:
                              output_folders: Dict[str, str],
                              process_ocr: bool,
                              process_md: bool,
-                             max_tokens: int,
+                             ocr_max_tokens: int,
+                             md_max_tokens: int,
                              temperature: float) -> Dict[str, Any]:
         """Process images in parallel with enhanced resource management"""
         debug_checkpoint("Starting parallel batch processing", "BATCH_PAR_START")
@@ -522,7 +524,7 @@ class EightBitBatchProcessor:
                     task_id += 1
                     future = executor.submit(
                         self.process_single_image_ocr,
-                        image_path, output_folders, max_tokens, task_id
+                        image_path, output_folders, ocr_max_tokens, task_id
                     )
                     futures.append(('ocr', future, task_id))
             
@@ -532,7 +534,7 @@ class EightBitBatchProcessor:
                     task_id += 1
                     future = executor.submit(
                         self.process_single_image_markdown,
-                        image_path, output_folders, max_tokens, temperature, task_id
+                        image_path, output_folders, md_max_tokens, temperature, task_id
                     )
                     futures.append(('md', future, task_id))
             
@@ -840,7 +842,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Input/Output arguments - FIXED: Changed --input_folder to --input to match error message
+    # Input/Output arguments
     parser.add_argument('--input', '-i', type=str, required=True,
                        help='Path to input folder containing images')
     parser.add_argument('--output', '-o', type=str, required=True,
@@ -863,10 +865,19 @@ def get_args():
     # Processing configuration
     parser.add_argument('--device', '-d', type=str, default=None,
                        help='Device to use (auto-detected if not specified)')
-    parser.add_argument('--max_tokens', type=int, default=1024,
-                       help='Maximum number of tokens to generate')
+    
+    # Enhanced token size configuration
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=1024,
+                       help='Maximum number of tokens to generate (default: 1024 for OCR, 2048 for markdown)')
+    parser.add_argument('--min_tokens', type=int, default=10,
+                       help='Minimum number of tokens to generate (default: 10)')
+    parser.add_argument('--ocr_tokens', type=int, default=None,
+                       help='Specific token limit for OCR tasks (overrides max_tokens for OCR)')
+    parser.add_argument('--md_tokens', type=int, default=None,
+                       help='Specific token limit for markdown tasks (overrides max_tokens for markdown)')
+    
     parser.add_argument('--temperature', '-t', type=float, default=0.1,
-                       help='Sampling temperature for markdown generation')
+                       help='Sampling temperature for markdown generation (0.0-1.0)')
     
     # Task selection
     parser.add_argument('--skip_ocr', action='store_true',
@@ -901,6 +912,25 @@ def main():
     
     args = get_args()
     
+    # Validate and configure token settings
+    if args.max_tokens < args.min_tokens:
+        logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
+        sys.exit(1)
+    
+    # Set task-specific token limits
+    ocr_max_tokens = args.ocr_tokens if args.ocr_tokens is not None else args.max_tokens
+    md_max_tokens = args.md_tokens if args.md_tokens is not None else (args.max_tokens if args.max_tokens != 1024 else 2048)
+    
+    # Validate token limits
+    if ocr_max_tokens > 4096:
+        logger.warning(f"Large OCR token limit ({ocr_max_tokens}) may cause memory issues")
+    if md_max_tokens > 8192:
+        logger.warning(f"Very large markdown token limit ({md_max_tokens}) may cause memory issues")
+    
+    if args.temperature < 0 or args.temperature > 1.0:
+        logger.error(f"Temperature must be between 0.0 and 1.0, got {args.temperature}")
+        sys.exit(1)
+    
     # Set logging level based on arguments
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -918,7 +948,7 @@ def main():
         logger.warning("Parallel processing requested but max_workers <= 1. Using sequential processing.")
         args.parallel = False
     
-    # Create configuration dict - FIXED: Updated to use args.input and args.output
+    # Create configuration dict
     config = {
         'model_checkpoint': args.model_checkpoint,
         'cache_dir': args.cache_dir,
@@ -927,6 +957,9 @@ def main():
         'mixed_precision': not args.no_mixed_precision,
         'force_fallback': args.force_fallback,
         'max_tokens': args.max_tokens,
+        'min_tokens': args.min_tokens,
+        'ocr_max_tokens': ocr_max_tokens,
+        'md_max_tokens': md_max_tokens,
         'temperature': args.temperature,
         'max_workers': args.max_workers,
         'parallel': args.parallel,
@@ -937,6 +970,7 @@ def main():
     }
     
     debug_checkpoint(f"Configuration: {config}")
+    debug_checkpoint(f"Token configuration - OCR: {ocr_max_tokens}, MD: {md_max_tokens}, Min: {args.min_tokens}")
     
     try:
         # Initialize batch processor
@@ -952,7 +986,7 @@ def main():
             use_process_pool=args.use_process_pool
         )
         
-        # Find images - FIXED: Updated to use args.input
+        # Find images
         logger.info(f"Scanning for images in: {args.input}")
         image_files = processor.find_images(args.input, args.image_extensions)
         
@@ -960,24 +994,25 @@ def main():
             logger.error(f"No valid images found in {args.input}")
             sys.exit(1)
         
-        # Create output structure - FIXED: Updated to use args.output
+        # Create output structure
         output_folders = processor.create_output_structure(args.output)
         
         # Process images
         logger.info(f"Starting 8-bit mixed precision batch processing of {len(image_files)} images")
         logger.info(f"Processing mode: {'Parallel' if args.parallel else 'Sequential'}")
+        logger.info(f"Token limits - OCR: {ocr_max_tokens}, Markdown: {md_max_tokens}")
         
         if args.parallel:
             results = processor.process_batch_parallel(
                 image_files, output_folders,
                 not args.skip_ocr, not args.skip_md,
-                args.max_tokens, args.temperature
+                ocr_max_tokens, md_max_tokens, args.temperature
             )
         else:
             results = processor.process_batch_sequential(
                 image_files, output_folders,
                 not args.skip_ocr, not args.skip_md,
-                args.max_tokens, args.temperature
+                ocr_max_tokens, md_max_tokens, args.temperature
             )
         
         # Create reports
