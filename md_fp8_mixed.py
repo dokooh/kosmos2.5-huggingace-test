@@ -800,10 +800,15 @@ def get_args():
                        help='Output path for generated markdown')
     parser.add_argument('--device', '-d', type=str, default=None,
                        help='Device to use (auto-detected if not specified)')
-    parser.add_argument('--max_tokens', type=int, default=2048,
-                       help='Maximum tokens to generate')
+    
+    # Enhanced token size configuration
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=2048,
+                       help='Maximum number of tokens to generate (default: 2048, recommended: 1024-4096)')
+    parser.add_argument('--min_tokens', type=int, default=50,
+                       help='Minimum number of tokens to generate (default: 50)')
+    
     parser.add_argument('--temperature', '-t', type=float, default=0.1,
-                       help='Sampling temperature (0 for deterministic)')
+                       help='Sampling temperature (0 for deterministic, 0.1-1.0 for creative)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
     parser.add_argument('--no_8bit', action='store_true',
@@ -828,6 +833,18 @@ def main():
     
     args = get_args()
     
+    # Validate token configuration
+    if args.max_tokens < args.min_tokens:
+        logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
+        sys.exit(1)
+    
+    if args.max_tokens > 8192:
+        logger.warning(f"Very large max_tokens ({args.max_tokens}) may cause memory issues or long processing times.")
+    
+    if args.temperature < 0 or args.temperature > 1.0:
+        logger.error(f"Temperature must be between 0.0 and 1.0, got {args.temperature}")
+        sys.exit(1)
+    
     # Set logging level
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -837,6 +854,7 @@ def main():
         debug_checkpoint("Verbose mode enabled")
     
     debug_checkpoint(f"Arguments: {vars(args)}")
+    debug_checkpoint(f"Token configuration - Max: {args.max_tokens}, Min: {args.min_tokens}, Temperature: {args.temperature}")
     
     # Initialize 8-bit mixed precision markdown inference
     debug_checkpoint("Initializing markdown engine")
@@ -865,7 +883,7 @@ def main():
                 sys.exit(1)
             
             debug_checkpoint(f"Found {len(image_paths)} images for batch processing")
-            logger.info(f"Processing {len(image_paths)} images in batch mode")
+            logger.info(f"Processing {len(image_paths)} images in batch mode with max_tokens={args.max_tokens}, temperature={args.temperature}")
             
             results = safe_execute(md_engine.batch_process, "Batch process images",
                 image_paths=image_paths,
@@ -895,6 +913,8 @@ def main():
             print(f"Average time per image: {total_time/len(results):.2f}s")
             print(f"Average words per image: {total_words/successful:.0f}" if successful > 0 else "N/A")
             print(f"Model checkpoint: {args.model_checkpoint}")
+            print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
+            print(f"Temperature: {args.temperature}")
             print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
             print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
             print(f"Output directory: {args.output}")
@@ -926,6 +946,8 @@ def main():
             print(f"Code blocks: {stats['code_blocks']}")
             print(f"Output saved to: {args.output}")
             print(f"Model checkpoint: {args.model_checkpoint}")
+            print(f"Token configuration: Max={args.max_tokens}, Min={args.min_tokens}")
+            print(f"Temperature: {args.temperature}")
             print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
             print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
             print(f"{'='*80}")
