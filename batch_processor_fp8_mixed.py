@@ -1,834 +1,907 @@
 #!/usr/bin/env python3
 """
-8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - FINAL DEVICE FIX
+Enhanced Batch Processor for Kosmos-2.5 8-bit Mixed Precision with Complete Device Management
 
-This module provides fast markdown generation using 8-bit mixed precision quantized Kosmos-2.5 model.
+This module provides comprehensive batch processing capabilities for both OCR and Markdown generation
+using the optimized 8-bit mixed precision modules (ocr_fp8_mixed.py and md_fp8_mixed.py).
+
 Features:
-- 8-bit mixed precision quantization for faster inference and reduced memory usage
-- BitsAndBytesConfig for advanced quantization settings
-- SafeTensors format support for faster loading
-- Support for local model checkpoints and remote models
-- Optimized memory usage with gradient checkpointing
-- Enhanced markdown post-processing with structure detection
-- Batch processing support with progress tracking
-- Comprehensive error handling and fallback mechanisms
-- EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
-- FINAL FIX: Complete device placement solution for 8-bit quantization
+- 8-bit mixed precision quantization with automatic fallback
+- Complete device placement management
+- Enhanced debugging and error handling
+- Parallel and sequential processing modes
+- Comprehensive progress tracking and reporting
+- SafeTensors format support
+- Memory optimization with gradient checkpointing
+- Robust error recovery and fallback mechanisms
 """
 
-import torch
-import requests
-import argparse
-import sys
 import os
+import sys
+import argparse
+import json
 import time
-import re
-import traceback as tb_module  # Avoid namespace conflict
-from PIL import Image
-from transformers import (
-    AutoProcessor, 
-    AutoModelForImageTextToText,
-    BitsAndBytesConfig
-)
 import logging
+import traceback
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import threading
+import queue
+import psutil
+
+# Import the 8-bit mixed precision inference modules
+try:
+    from ocr_fp8_mixed import EightBitOCRInference, debug_checkpoint, debug_memory_status
+    from md_fp8_mixed import EightBitMarkdownInference
+except ImportError as e:
+    print(f"Error importing 8-bit mixed precision modules: {e}")
+    print("Make sure ocr_fp8_mixed.py and md_fp8_mixed.py are in the same directory")
+    sys.exit(1)
 
 # Enhanced logging setup with more detailed formatting
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('md_debug.log', mode='w')
+        logging.FileHandler('batch_fp8_debug.log', mode='w')
     ]
 )
 logger = logging.getLogger(__name__)
 
-def debug_checkpoint(message, checkpoint_id=None):
-    """Debug checkpoint function to track execution flow"""
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    if checkpoint_id:
-        logger.debug(f"🔍 CHECKPOINT [{checkpoint_id}]: {message}")
-        print(f"[{timestamp}] 🔍 CHECKPOINT [{checkpoint_id}]: {message}", flush=True)
-    else:
-        logger.debug(f"🔍 DEBUG: {message}")
-        print(f"[{timestamp}] 🔍 DEBUG: {message}", flush=True)
-
-def debug_memory_status():
-    """Debug memory status"""
-    if torch.cuda.is_available():
-        try:
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            debug_checkpoint(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Total: {total:.2f}GB")
-        except Exception as e:
-            debug_checkpoint(f"Failed to get GPU memory status: {e}")
-    else:
-        debug_checkpoint("CUDA not available")
-
-def debug_tensor_devices(tensor_dict, name="Tensors"):
-    """Debug tensor device placement"""
-    debug_checkpoint(f"Checking {name} device placement:")
-    for key, tensor in tensor_dict.items():
-        if isinstance(tensor, torch.Tensor):
-            debug_checkpoint(f"  {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
-        else:
-            debug_checkpoint(f"  {key}: {type(tensor)} (not a tensor)")
-
-def move_to_device_safe(data, device, dtype=None):
-    """Safely move data to device with proper error handling"""
-    if isinstance(data, torch.Tensor):
-        try:
-            # Check if tensor is already on the target device
-            if data.device.type == device.split(':')[0]:
-                if dtype is not None and data.dtype != dtype and data.dtype not in [torch.int32, torch.int64, torch.bool]:
-                    return data.to(dtype=dtype)
-                return data
-            
-            if dtype is not None and data.dtype != dtype and data.dtype not in [torch.int32, torch.int64, torch.bool]:
-                return data.to(device=device, dtype=dtype)
-            else:
-                return data.to(device=device)
-        except Exception as e:
-            debug_checkpoint(f"Warning: Failed to move tensor to {device}: {e}")
-            return data
-    elif isinstance(data, dict):
-        return {k: move_to_device_safe(v, device, dtype) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [move_to_device_safe(item, device, dtype) for item in data]
-    else:
-        return data
-
-def safe_execute(func, description, *args, **kwargs):
-    """Safely execute a function with detailed error reporting"""
-    debug_checkpoint(f"Starting: {description}")
-    try:
-        result = func(*args, **kwargs)
-        debug_checkpoint(f"Completed: {description}")
-        return result
-    except Exception as e:
-        debug_checkpoint(f"FAILED: {description} - Error: {str(e)}")
-        logger.error(f"Exception in {description}: {tb_module.format_exc()}")
-        raise
-
-def tensor_to_float(tensor_val):
-    """Safely convert tensor to float for formatting"""
-    if isinstance(tensor_val, torch.Tensor):
-        return float(tensor_val.item())
-    return float(tensor_val)
-
-class EightBitMarkdownInference:
-    def __init__(self, model_checkpoint, device=None, cache_dir=None, use_8bit=True, mixed_precision=True, force_fallback=False):
+class EightBitBatchProcessor:
+    """Enhanced batch processor for 8-bit mixed precision Kosmos-2.5 models"""
+    
+    def __init__(self, 
+                 model_checkpoint: str,
+                 device: str = None,
+                 cache_dir: str = None,
+                 use_8bit: bool = True,
+                 mixed_precision: bool = True,
+                 force_fallback: bool = False,
+                 max_workers: int = 1,
+                 use_process_pool: bool = False):
         """
-        Initialize 8-bit Mixed Precision Markdown inference
+        Initialize the 8-bit mixed precision batch processor
         
         Args:
             model_checkpoint (str): Path to model checkpoint (local directory or HuggingFace model name)
             device (str): Device to use for inference
-            cache_dir (str): Cache directory for downloaded models
+            cache_dir (str): Cache directory for models
             use_8bit (bool): Enable 8-bit quantization
             mixed_precision (bool): Enable mixed precision for critical layers
             force_fallback (bool): Force use of fallback mode (no 8-bit)
+            max_workers (int): Maximum number of parallel workers
+            use_process_pool (bool): Use process pool instead of thread pool for true parallelism
         """
-        debug_checkpoint("Initializing EightBitMarkdownInference", "INIT_START")
+        debug_checkpoint("Initializing EightBitBatchProcessor", "BATCH_INIT_START")
         
         self.model_checkpoint = model_checkpoint
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.cache_dir = cache_dir
-        self.use_8bit = use_8bit and torch.cuda.is_available() and not force_fallback
+        self.use_8bit = use_8bit
         self.mixed_precision = mixed_precision
         self.force_fallback = force_fallback
-        self.model = None
-        self.processor = None
+        self.max_workers = max_workers
+        self.use_process_pool = use_process_pool
         
-        debug_checkpoint(f"Parameters - Model: {model_checkpoint}, Device: {self.device}, 8bit: {self.use_8bit}")
-        
-        # Determine model type
+        # Validate model checkpoint
         self.is_local_checkpoint = os.path.exists(model_checkpoint)
-        debug_checkpoint(f"Local checkpoint: {self.is_local_checkpoint}")
         
-        # Configure precision settings
-        safe_execute(self._configure_precision, "Configure precision settings")
+        # Thread-local storage for inference engines
+        self._local = threading.local()
         
-        logger.info(f"Initializing 8-bit Mixed Precision Markdown inference on {self.device}")
+        # Progress tracking
+        self.progress_queue = queue.Queue()
+        self.total_tasks = 0
+        self.completed_tasks = 0
+        
+        # Performance metrics
+        self.start_time = None
+        self.system_info = self._get_system_info()
+        
+        logger.info(f"Initialized 8-bit Mixed Precision Batch Processor")
         logger.info(f"Model checkpoint: {self.model_checkpoint}")
+        logger.info(f"Local checkpoint: {self.is_local_checkpoint}")
+        logger.info(f"Device: {self.device}")
         logger.info(f"8-bit quantization: {self.use_8bit}")
         logger.info(f"Mixed precision: {self.mixed_precision}")
-        logger.info(f"Local checkpoint: {self.is_local_checkpoint}")
         logger.info(f"Force fallback: {self.force_fallback}")
+        logger.info(f"Max workers: {self.max_workers}")
+        logger.info(f"Use process pool: {self.use_process_pool}")
         
-        debug_checkpoint("EightBitMarkdownInference initialization completed", "INIT_END")
+        debug_checkpoint("EightBitBatchProcessor initialization completed", "BATCH_INIT_END")
     
-    def _configure_precision(self):
-        """Configure precision and quantization settings"""
-        debug_checkpoint("Configuring precision settings", "PRECISION_START")
-        
-        if self.use_8bit:
-            debug_checkpoint("Setting up 8-bit quantization")
-            # More conservative 8-bit configuration to avoid device issues
-            debug_checkpoint("Creating conservative BitsAndBytesConfig")
-            self.quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_enable_fp32_cpu_offload=False,  # Disable CPU offload to keep everything on GPU
-                llm_int8_has_fp16_weight=False,
-                llm_int8_threshold=6.0,
-            )
-            debug_checkpoint("Conservative BitsAndBytesConfig created successfully")
-            
-            # Use float16 for non-quantized operations
-            self.dtype = torch.float16
-            debug_checkpoint("Set dtype to float16 for 8-bit mode")
-        else:
-            debug_checkpoint("Setting up non-8bit precision")
-            self.quantization_config = None
-            # Use bfloat16 for better performance on modern hardware
-            if self.device.startswith('cuda') and torch.cuda.is_bf16_supported():
-                self.dtype = torch.bfloat16
-                logger.info("Using bfloat16 for optimal performance")
-                debug_checkpoint("Set dtype to bfloat16")
-            elif self.device.startswith('cuda'):
-                self.dtype = torch.float16
-                logger.info("Using float16")
-                debug_checkpoint("Set dtype to float16")
-            else:
-                self.dtype = torch.float32
-                logger.info("Using float32 for CPU")
-                debug_checkpoint("Set dtype to float32 for CPU")
-        
-        debug_checkpoint("Precision configuration completed", "PRECISION_END")
-    
-    def _validate_checkpoint(self, checkpoint_path):
-        """Validate that the checkpoint contains required files"""
-        debug_checkpoint(f"Validating checkpoint: {checkpoint_path}", "VALIDATE_START")
-        
-        if not os.path.isdir(checkpoint_path):
-            debug_checkpoint("Checkpoint path is not a directory")
-            return False
-        
-        debug_checkpoint("Scanning checkpoint directory for files")
+    def _get_system_info(self) -> Dict[str, Any]:
+        """Get system information for performance analysis"""
         try:
-            files = os.listdir(checkpoint_path)
-            debug_checkpoint(f"Found {len(files)} files in checkpoint directory")
-            
-            # Check for model files (SafeTensors or PyTorch)
-            model_files = [f for f in files if f.endswith(('.safetensors', '.bin', '.pt'))]
-            config_files = [f for f in files if f in ['config.json', 'model.safetensors.index.json', 'pytorch_model.bin.index.json']]
-            
-            debug_checkpoint(f"Model files: {model_files}")
-            debug_checkpoint(f"Config files: {config_files}")
-            
-            has_model = len(model_files) > 0
-            has_config = len(config_files) > 0
-            
-            if has_model and has_config:
-                logger.info(f"✓ Found {len(model_files)} model files in {checkpoint_path}")
-                debug_checkpoint("Checkpoint validation successful", "VALIDATE_END")
-                return True
-            else:
-                logger.warning(f"⚠ Checkpoint missing required files. Model files: {has_model}, Config: {has_config}")
-                debug_checkpoint("Checkpoint validation failed", "VALIDATE_END")
-                return False
+            import torch
+            return {
+                'cpu_count': psutil.cpu_count(logical=False),
+                'cpu_count_logical': psutil.cpu_count(logical=True),
+                'memory_total_gb': psutil.virtual_memory().total / (1024**3),
+                'cuda_available': torch.cuda.is_available(),
+                'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                'cuda_memory_gb': torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
+            }
         except Exception as e:
-            debug_checkpoint(f"Error during checkpoint validation: {e}")
-            return False
+            debug_checkpoint(f"Failed to get system info: {e}")
+            return {}
     
-    def load_model(self):
-        """Load model with 8-bit mixed precision quantization"""
-        debug_checkpoint("Starting model loading", "LOAD_MODEL_START")
-        
-        if self.model is not None:
-            debug_checkpoint("Model already loaded, skipping")
-            return
-            
-        logger.info("Loading Kosmos-2.5 model with 8-bit mixed precision...")
-        debug_memory_status()
-        
-        # Validate local checkpoint if specified
-        if self.is_local_checkpoint:
-            debug_checkpoint("Validating local checkpoint")
-            if not safe_execute(self._validate_checkpoint, "Validate checkpoint", self.model_checkpoint):
-                logger.error(f"Invalid checkpoint directory: {self.model_checkpoint}")
-                raise ValueError("Checkpoint path does not contain valid model files")
-        
-        # Try 8-bit loading first, then fallback if it fails
-        model_loaded = False
-        
-        if self.use_8bit and not self.force_fallback:
-            debug_checkpoint("Attempting 8-bit model loading", "8BIT_ATTEMPT")
+    def _get_ocr_engine(self) -> EightBitOCRInference:
+        """Get thread-local OCR engine with proper initialization"""
+        if not hasattr(self._local, 'ocr_engine') or self._local.ocr_engine is None:
+            debug_checkpoint("Creating thread-local OCR engine")
             try:
-                model_loaded = self._load_8bit_model()
-                debug_checkpoint("8-bit model loading successful", "8BIT_SUCCESS")
+                self._local.ocr_engine = EightBitOCRInference(
+                    model_checkpoint=self.model_checkpoint,
+                    device=self.device,
+                    cache_dir=self.cache_dir,
+                    use_8bit=self.use_8bit,
+                    mixed_precision=self.mixed_precision,
+                    force_fallback=self.force_fallback
+                )
+                debug_checkpoint("Thread-local OCR engine created successfully")
             except Exception as e:
-                debug_checkpoint(f"8-bit model loading failed: {str(e)}", "8BIT_FAILED")
-                logger.warning(f"8-bit loading failed, will try fallback: {e}")
-                # Don't re-raise, let it fall through to fallback
-        
-        if not model_loaded:
-            debug_checkpoint("Attempting fallback model loading", "FALLBACK_ATTEMPT")
-            try:
-                self._load_fallback_model()
-                debug_checkpoint("Fallback model loading successful", "FALLBACK_SUCCESS")
-            except Exception as e:
-                debug_checkpoint(f"Fallback model loading failed: {str(e)}", "FALLBACK_FAILED")
-                logger.error(f"Both 8-bit and fallback loading failed: {e}")
+                debug_checkpoint(f"Failed to create OCR engine: {e}")
                 raise
-        
-        # Common post-loading setup
-        self._post_loading_setup()
-        
-        debug_checkpoint("Model loading completed successfully", "LOAD_MODEL_END")
+        return self._local.ocr_engine
     
-    def _load_8bit_model(self):
-        """Load model with 8-bit quantization"""
-        debug_checkpoint("Loading 8-bit quantized model", "8BIT_LOAD_START")
+    def _get_md_engine(self) -> EightBitMarkdownInference:
+        """Get thread-local Markdown engine with proper initialization"""
+        if not hasattr(self._local, 'md_engine') or self._local.md_engine is None:
+            debug_checkpoint("Creating thread-local Markdown engine")
+            try:
+                self._local.md_engine = EightBitMarkdownInference(
+                    model_checkpoint=self.model_checkpoint,
+                    device=self.device,
+                    cache_dir=self.cache_dir,
+                    use_8bit=self.use_8bit,
+                    mixed_precision=self.mixed_precision,
+                    force_fallback=self.force_fallback
+                )
+                debug_checkpoint("Thread-local Markdown engine created successfully")
+            except Exception as e:
+                debug_checkpoint(f"Failed to create Markdown engine: {e}")
+                raise
+        return self._local.md_engine
+    
+    def find_images(self, input_folder: str, extensions: List[str]) -> List[str]:
+        """Find all image files in the input folder with enhanced filtering"""
+        debug_checkpoint(f"Scanning for images in: {input_folder}", "FIND_IMAGES_START")
         
-        # Configure loading parameters for 8-bit
-        loading_kwargs = {
-            "cache_dir": self.cache_dir,
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-            "quantization_config": self.quantization_config,
-            "torch_dtype": self.dtype,
+        image_files = []
+        input_path = Path(input_folder)
+        
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input folder not found: {input_folder}")
+        
+        if not input_path.is_dir():
+            raise ValueError(f"Input path is not a directory: {input_folder}")
+        
+        # Search for images with case-insensitive extensions
+        for ext in extensions:
+            # Search for both lowercase and uppercase extensions
+            for case_ext in [ext.lower(), ext.upper()]:
+                pattern = f"*{case_ext}"
+                found_files = list(input_path.glob(pattern))
+                image_files.extend(found_files)
+        
+        # Remove duplicates and convert to strings
+        image_files = list(set([str(f) for f in image_files]))
+        image_files.sort()
+        
+        # Validate image files
+        valid_images = []
+        for img_file in image_files:
+            try:
+                from PIL import Image
+                with Image.open(img_file) as img:
+                    # Quick validation
+                    img.verify()
+                valid_images.append(img_file)
+            except Exception as e:
+                logger.warning(f"Skipping invalid image {Path(img_file).name}: {e}")
+        
+        logger.info(f"Found {len(valid_images)} valid images in {input_folder}")
+        debug_checkpoint(f"Image scanning completed. Found {len(valid_images)} valid images", "FIND_IMAGES_END")
+        
+        return valid_images
+    
+    def create_output_structure(self, output_folder: str) -> Dict[str, str]:
+        """Create comprehensive output folder structure with detailed organization"""
+        debug_checkpoint(f"Creating output structure: {output_folder}", "OUTPUT_STRUCT_START")
+        
+        output_path = Path(output_folder)
+        
+        # Create main output folder
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create comprehensive subfolders
+        folders = {
+            'markdown': output_path / "markdown_output",
+            'ocr_images': output_path / "ocr_annotated_images", 
+            'ocr_text': output_path / "ocr_text_results",
+            'logs': output_path / "processing_logs",
+            'reports': output_path / "analysis_reports",
+            'debug': output_path / "debug_info",
+            'errors': output_path / "error_logs",
+            'performance': output_path / "performance_metrics"
         }
         
-        # For 8-bit, use more conservative device mapping
-        if torch.cuda.device_count() > 1:
-            # Multi-GPU: use specific device
-            loading_kwargs["device_map"] = {
-                "": f"cuda:{torch.cuda.current_device()}"
-            }
-            debug_checkpoint(f"Multi-GPU setup: using device cuda:{torch.cuda.current_device()}")
-        else:
-            # Single GPU: use specific device instead of auto
-            loading_kwargs["device_map"] = {"": self.device}
-            debug_checkpoint(f"Single GPU setup: using device {self.device}")
+        for folder_name, folder_path in folders.items():
+            folder_path.mkdir(exist_ok=True)
+            debug_checkpoint(f"Created folder: {folder_name} -> {folder_path}")
         
-        # Configure for local vs remote loading
-        if self.is_local_checkpoint:
-            loading_kwargs.update({
-                "local_files_only": True,
-                "use_safetensors": True,
-            })
-        else:
-            loading_kwargs.update({
-                "local_files_only": False,
-                "use_safetensors": True,
-                "resume_download": True,
-            })
+        # Convert to strings for easier handling
+        folder_paths = {k: str(v) for k, v in folders.items()}
         
-        debug_checkpoint(f"8-bit loading kwargs: {loading_kwargs}")
+        logger.info("Created comprehensive output folder structure:")
+        for name, path in folder_paths.items():
+            logger.info(f"  {name}: {path}")
         
-        # Load the model
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_checkpoint,
-            **loading_kwargs
-        )
-        
-        debug_checkpoint("8-bit model loaded", "8BIT_LOAD_END")
-        return True
+        debug_checkpoint("Output structure creation completed", "OUTPUT_STRUCT_END")
+        return folder_paths
     
-    def _load_fallback_model(self):
-        """Load model without 8-bit quantization as fallback"""
-        debug_checkpoint("Loading fallback model", "FALLBACK_LOAD_START")
-        
-        # Disable 8-bit for fallback
-        self.use_8bit = False
-        
-        fallback_kwargs = {
-            "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
-            "cache_dir": self.cache_dir,
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-            "device_map": None,  # We'll handle device placement manually
-        }
-        
-        if self.is_local_checkpoint:
-            fallback_kwargs["local_files_only"] = True
-        
-        debug_checkpoint(f"Fallback kwargs: {fallback_kwargs}")
-        
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_checkpoint,
-            **fallback_kwargs
-        )
-        
-        # Move to device manually for fallback
-        if torch.cuda.is_available():
-            debug_checkpoint("Moving fallback model to GPU")
-            self.model = self.model.to(self.device)
-            if self.dtype == torch.float16:
-                self.model = self.model.half()
-        
-        debug_checkpoint("Fallback model loaded", "FALLBACK_LOAD_END")
-    
-    def _post_loading_setup(self):
-        """Common setup after model loading"""
-        debug_checkpoint("Starting post-loading setup", "POSTLOAD_START")
-        
-        # Load processor
-        debug_checkpoint("Loading processor", "PROCESSOR_LOAD_START")
-        processor_kwargs = {
-            "cache_dir": self.cache_dir,
-            "trust_remote_code": True,
-            "use_fast": True,
-        }
-        
-        if self.is_local_checkpoint:
-            processor_kwargs["local_files_only"] = True
-        else:
-            processor_kwargs.update({
-                "local_files_only": False,
-                "resume_download": True
-            })
-        
-        debug_checkpoint(f"Processor loading kwargs: {processor_kwargs}")
-        
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_checkpoint,
-            **processor_kwargs
-        )
-        debug_checkpoint("Processor loaded", "PROCESSOR_LOAD_END")
-        
-        # Set pad token if not present
-        if self.processor.tokenizer.pad_token is None:
-            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
-            debug_checkpoint("Set pad token to eos token")
-        
-        # Set model to eval mode
-        if hasattr(self.model, 'eval'):
-            self.model.eval()
-            debug_checkpoint("Model set to eval mode")
-        
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            debug_checkpoint("Enabled gradient checkpointing")
-        
-        debug_checkpoint("Post-loading setup completed", "POSTLOAD_END")
-    
-    def load_image(self, image_path):
-        """Load image from local path or URL with error handling"""
-        debug_checkpoint(f"Loading image: {image_path}", "IMAGE_LOAD_START")
-        
-        try:
-            if image_path.startswith(('http://', 'https://')):
-                debug_checkpoint("Loading image from URL")
-                logger.info(f"Loading image from URL: {image_path}")
-                response = requests.get(image_path, stream=True, timeout=30)
-                response.raise_for_status()
-                image = Image.open(response.raw)
-                debug_checkpoint("URL image loaded successfully")
-            else:
-                debug_checkpoint("Loading image from file")
-                logger.info(f"Loading image from file: {image_path}")
-                if not os.path.exists(image_path):
-                    debug_checkpoint("Image file not found")
-                    raise FileNotFoundError(f"Image file not found: {image_path}")
-                image = Image.open(image_path)
-                debug_checkpoint("File image loaded successfully")
-            
-            # Convert to RGB and validate
-            debug_checkpoint("Converting image to RGB")
-            image = image.convert('RGB')
-            logger.info(f"Image loaded successfully. Size: {image.size}")
-            debug_checkpoint(f"Image conversion completed. Size: {image.size}", "IMAGE_LOAD_END")
-            return image
-            
-        except Exception as e:
-            debug_checkpoint(f"Image loading failed: {str(e)}", "IMAGE_LOAD_FAILED")
-            logger.error(f"Error loading image: {e}")
-            raise
-    
-    def post_process_markdown(self, generated_text, prompt="<md>"):
-        """Post-process and clean up generated markdown with enhanced structure detection"""
-        debug_checkpoint("Starting markdown post-processing", "POSTPROCESS_START")
-        
-        # Remove the prompt
-        markdown = generated_text.replace(prompt, "").strip()
-        debug_checkpoint(f"Cleaned text length: {len(markdown)}")
-        
-        # Enhanced markdown cleaning
-        markdown = safe_execute(self.clean_markdown_advanced, "Clean markdown advanced", markdown)
-        
-        debug_checkpoint("Markdown post-processing completed", "POSTPROCESS_END")
-        return markdown
-    
-    def clean_markdown_advanced(self, text):
-        """Advanced markdown cleaning with structure detection"""
-        debug_checkpoint("Starting advanced markdown cleaning")
-        
-        # Remove extra whitespace and clean up
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        in_code_block = False
-        for line in lines:
-            # Handle code blocks
-            if line.strip().startswith('```'):
-                in_code_block = not in_code_block
-                cleaned_lines.append(line.strip())
-                continue
-            
-            if in_code_block:
-                # Preserve code block formatting
-                cleaned_lines.append(line)
-                continue
-            
-            line = line.strip()
-            # Remove any remaining HTML-like tags (except in code)
-            line = re.sub(r'<(?!code|pre)[^>]+>', '', line)
-            
-            if line:  # Skip empty lines initially
-                cleaned_lines.append(line)
-        
-        # Join lines back
-        text = '\n'.join(cleaned_lines)
-        
-        # Advanced markdown formatting fixes
-        
-        # Fix headers - ensure proper spacing and format
-        text = re.sub(r'^(#{1,6})\s*(.+)', r'\1 \2', text, flags=re.MULTILINE)
-        
-        # Ensure proper spacing around headers
-        text = re.sub(r'(?<!^)(?<!\n)(^#{1,6}.*$)', r'\n\1', text, flags=re.MULTILINE)
-        text = re.sub(r'(^#{1,6}.*$)(?!\n)(?!\Z)', r'\1\n', text, flags=re.MULTILINE)
-        
-        # Fix list items with proper indentation
-        text = re.sub(r'^[\*\-\+]\s+', '- ', text, flags=re.MULTILINE)
-        text = re.sub(r'^(\s*)(\d+)\.\s+', r'\1\2. ', text, flags=re.MULTILINE)
-        
-        # Fix nested lists
-        text = re.sub(r'^(\s+)[\*\-\+]\s+', r'\1- ', text, flags=re.MULTILINE)
-        
-        # Fix table formatting
-        text = re.sub(r'\|\s*([^|]+?)\s*\|', lambda m: '| ' + m.group(1).strip() + ' |', text)
-        
-        # Ensure table header separators
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            if '|' in line and i < len(lines) - 1:
-                next_line = lines[i + 1]
-                if '|' in next_line and not re.match(r'^\s*\|[\s\-:]+\|\s*$', next_line):
-                    # Check if this looks like a header row
-                    if line.count('|') >= 2 and not re.match(r'^\s*\|[\s\-:]+\|\s*$', line):
-                        # Insert separator row
-                        cols = line.count('|') - 1
-                        separator = '|' + '---|' * cols
-                        lines.insert(i + 1, separator)
-                        break
-        text = '\n'.join(lines)
-        
-        # Fix emphasis and strong formatting
-        text = re.sub(r'\*\*([^*]+?)\*\*', r'**\1**', text)
-        text = re.sub(r'\*([^*]+?)\*', r'*\1*', text)
-        text = re.sub(r'__([^_]+?)__', r'**\1**', text)
-        text = re.sub(r'_([^_]+?)_', r'*\1*', text)
-        
-        # Fix links
-        text = re.sub(r'\[([^\]]+?)\]\s*\(([^\)]+?)\)', r'[\1](\2)', text)
-        
-        # Fix code spans
-        text = re.sub(r'`([^`]+?)`', r'`\1`', text)
-        
-        # Remove excessive newlines but preserve intentional spacing
-        text = re.sub(r'\n{4,}', '\n\n\n', text)  # Max 3 newlines
-        text = re.sub(r'\n{3}(?=\n)', '\n\n', text)  # Reduce 3+ to 2
-        
-        # Ensure proper spacing around block elements
-        text = re.sub(r'(\n#+.*\n)(\w)', r'\1\n\2', text)  # Space after headers
-        text = re.sub(r'(\w)(\n#+.*)', r'\1\n\2', text)    # Space before headers
-        
-        # Ensure text starts and ends cleanly
-        text = text.strip()
-        
-        debug_checkpoint(f"Advanced markdown cleaning completed: '{text[:100]}...'")
-        return text
-    
-    def generate_markdown(self, image_path, max_tokens=2048, temperature=0.1, save_output=None):
-        """Generate markdown from image using 8-bit mixed precision"""
-        debug_checkpoint("Starting markdown generation", "MD_START")
-        
-        if self.model is None:
-            debug_checkpoint("Model not loaded, loading now")
-            safe_execute(self.load_model, "Load model")
-        
-        # Load and process image
-        image = safe_execute(self.load_image, "Load image", image_path)
-        
-        prompt = "<md>"
+    def process_single_image_ocr(self, 
+                                image_path: str, 
+                                output_folders: Dict[str, str],
+                                max_tokens: int,
+                                task_id: int = 0) -> Dict[str, Any]:
+        """Process a single image for OCR with comprehensive error handling"""
+        image_name = Path(image_path).stem
         start_time = time.time()
-        debug_checkpoint(f"Starting inference with prompt: {prompt}")
+        
+        debug_checkpoint(f"Starting OCR processing for: {image_name}", f"OCR_TASK_{task_id}_START")
         
         try:
-            # Process inputs
-            debug_checkpoint("Processing inputs with processor", "PROCESS_INPUTS_START")
-            inputs = self.processor(text=prompt, images=image, return_tensors="pt")
-            debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
+            # Get thread-local OCR engine
+            ocr_engine = self._get_ocr_engine()
             
-            # Debug input tensor devices before any processing
-            debug_tensor_devices(inputs, "Raw processor inputs")
+            # Generate output paths
+            output_image = Path(output_folders['ocr_images']) / f"{image_name}_ocr_annotated.png"
+            output_text = Path(output_folders['ocr_text']) / f"{image_name}_ocr_results.txt"
             
-            # Remove height/width info (not needed for generation but handle gracefully)
-            height = inputs.pop("height", None)
-            width = inputs.pop("width", None)
-            if height is not None:
-                debug_checkpoint(f"Removed height: {tensor_to_float(height)}")
-            if width is not None:
-                debug_checkpoint(f"Removed width: {tensor_to_float(width)}")
-            
-            debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
-            
-            # FINAL DEVICE PLACEMENT FIX
-            debug_checkpoint("Moving inputs to device", "DEVICE_MOVE_START")
+            logger.info(f"[Task {task_id}] Processing OCR for: {Path(image_path).name}")
             debug_memory_status()
             
-            # Get model device (where the first parameter is located)
-            model_device = next(self.model.parameters()).device
-            debug_checkpoint(f"Model is on device: {model_device}")
+            # Perform OCR with comprehensive error handling
+            result = ocr_engine.perform_ocr(
+                image_path=image_path,
+                max_tokens=max_tokens,
+                save_image=str(output_image),
+                save_text=str(output_text)
+            )
             
-            # Move all inputs to the same device as the model
-            debug_checkpoint("Moving all inputs to model device")
-            for key in inputs:
-                if isinstance(inputs[key], torch.Tensor):
-                    old_device = inputs[key].device
-                    inputs[key] = inputs[key].to(model_device)
-                    debug_checkpoint(f"Moved {key} from {old_device} to {inputs[key].device}")
+            processing_time = time.time() - start_time
             
-            # Final device verification
-            debug_tensor_devices(inputs, "Final processed inputs")
-            debug_checkpoint("Device move completed", "DEVICE_MOVE_END")
-            debug_memory_status()
+            # Extract comprehensive statistics
+            stats = result.get('statistics', {})
             
-            # Generate markdown
-            debug_checkpoint("Starting markdown inference generation", "GENERATION_START")
-            logger.info("Generating markdown with 8-bit mixed precision...")
-            
-            with torch.no_grad():
-                debug_checkpoint("Entered torch.no_grad() context")
-                
-                # Clear GPU cache before generation
-                if torch.cuda.is_available():
-                    debug_checkpoint("Clearing CUDA cache")
-                    torch.cuda.empty_cache()
-                    debug_memory_status()
-                
-                # Enhanced generation with better error handling
-                generation_kwargs = {
-                    "max_new_tokens": max_tokens,
-                    "do_sample": temperature > 0,
-                    "temperature": temperature if temperature > 0 else None,
-                    "pad_token_id": self.processor.tokenizer.eos_token_id,
-                    "eos_token_id": self.processor.tokenizer.eos_token_id,
-                    "repetition_penalty": 1.1,
-                    "length_penalty": 1.0,
-                    "use_cache": True,
-                    "num_beams": 1,
-                    "early_stopping": True,
-                }
-                
-                debug_checkpoint(f"Generation kwargs: {generation_kwargs}")
-                
-                # Use mixed precision if enabled and not using 8-bit quantization
-                if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
-                    debug_checkpoint("Using mixed precision autocast")
-                    with torch.cuda.amp.autocast(dtype=self.dtype):
-                        debug_checkpoint("Inside autocast context, calling model.generate")
-                        generated_ids = self.model.generate(
-                            **inputs,
-                            **generation_kwargs
-                        )
-                        debug_checkpoint("model.generate completed with autocast")
-                else:
-                    debug_checkpoint("Using standard generation (no autocast)")
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        **generation_kwargs
-                    )
-                    debug_checkpoint("model.generate completed without autocast")
-            
-            debug_checkpoint("Generation completed", "GENERATION_END")
-            debug_memory_status()
-            
-            # Decode results
-            debug_checkpoint("Decoding generated results", "DECODE_START")
-            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            debug_checkpoint(f"Decoded text length: {len(generated_text)}")
-            debug_checkpoint(f"Generated text preview: '{generated_text[:100]}...'")
-            debug_checkpoint("Decoding completed", "DECODE_END")
-            
-            # Post-process markdown
-            markdown_output = safe_execute(self.post_process_markdown, "Post-process markdown", generated_text, prompt)
-            
-            inference_time = time.time() - start_time
-            logger.info(f"Markdown generation completed in {inference_time:.2f}s")
-            debug_checkpoint(f"Markdown generation completed in {inference_time:.2f}s")
-            
-            # Calculate statistics
-            debug_checkpoint("Calculating statistics")
-            word_count = len(markdown_output.split())
-            char_count = len(markdown_output)
-            line_count = len(markdown_output.split('\n'))
-            
-            # Detect markdown elements
-            headers = len(re.findall(r'^#+\s', markdown_output, re.MULTILINE))
-            lists = len(re.findall(r'^[\*\-\+]\s|^\d+\.\s', markdown_output, re.MULTILINE))
-            tables = markdown_output.count('|')
-            code_blocks = markdown_output.count('```') // 2
-            
-            debug_checkpoint(f"Statistics - Words: {word_count}, Headers: {headers}, Lists: {lists}")
-            
-            # Save output if requested
-            if save_output:
-                debug_checkpoint("Saving markdown output")
-                safe_execute(self.save_markdown, "Save markdown", markdown_output, save_output)
-            
-            result = {
-                'markdown': markdown_output,
-                'inference_time': inference_time,
-                'raw_output': generated_text,
-                'statistics': {
-                    'word_count': word_count,
-                    'char_count': char_count,
-                    'line_count': line_count,
-                    'headers': headers,
-                    'lists': lists,
-                    'tables': tables,
-                    'code_blocks': code_blocks
-                }
+            success_result = {
+                'success': True,
+                'task_id': task_id,
+                'image_path': image_path,
+                'image_name': image_name,
+                'output_image': str(output_image),
+                'output_text': str(output_text),
+                'text_regions': stats.get('total_regions', 0),
+                'total_text_length': stats.get('total_text_length', 0),
+                'avg_confidence': stats.get('avg_confidence', 0.0),
+                'image_size': stats.get('image_size', [0, 0]),
+                'processing_time': processing_time,
+                'inference_time': result.get('inference_time', 0),
+                'quantization_used': '8-bit' if ocr_engine.use_8bit else 'FP16/BF16',
+                'results': result.get('results', []),
+                'raw_output_length': len(result.get('raw_output', ''))
             }
             
-            debug_checkpoint("Markdown generation completed successfully", "MD_END")
-            return result
+            debug_checkpoint(f"OCR processing completed successfully for: {image_name}", f"OCR_TASK_{task_id}_SUCCESS")
+            return success_result
             
         except Exception as e:
-            debug_checkpoint(f"Markdown generation failed with error: {str(e)}", "MD_FAILED")
-            logger.error(f"Error during markdown generation: {e}")
-            logger.error(f"Full traceback: {tb_module.format_exc()}")
-            raise
+            processing_time = time.time() - start_time
+            error_msg = f"OCR failed for {Path(image_path).name}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Save detailed error information
+            error_file = Path(output_folders['errors']) / f"{image_name}_ocr_error.txt"
+            try:
+                with open(error_file, 'w', encoding='utf-8') as f:
+                    f.write(f"OCR Processing Error Report\n")
+                    f.write(f"{'='*50}\n")
+                    f.write(f"Image: {image_path}\n")
+                    f.write(f"Error: {str(e)}\n")
+                    f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Processing time: {processing_time:.2f}s\n\n")
+                    f.write(f"Full traceback:\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass  # Don't fail on error logging
+            
+            error_result = {
+                'success': False,
+                'task_id': task_id,
+                'image_path': image_path,
+                'image_name': image_name,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'processing_time': processing_time,
+                'error_file': str(error_file)
+            }
+            
+            debug_checkpoint(f"OCR processing failed for: {image_name}", f"OCR_TASK_{task_id}_FAILED")
+            return error_result
     
-    def save_markdown(self, markdown_text, output_path):
-        """Save markdown to file with metadata"""
-        debug_checkpoint(f"Saving markdown to: {output_path}", "SAVE_MD_START")
+    def process_single_image_markdown(self, 
+                                    image_path: str, 
+                                    output_folders: Dict[str, str],
+                                    max_tokens: int,
+                                    temperature: float,
+                                    task_id: int = 0) -> Dict[str, Any]:
+        """Process a single image for Markdown generation with comprehensive error handling"""
+        image_name = Path(image_path).stem
+        start_time = time.time()
+        
+        debug_checkpoint(f"Starting Markdown processing for: {image_name}", f"MD_TASK_{task_id}_START")
         
         try:
-            # Ensure output directory exists
-            output_dir = os.path.dirname(output_path)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
+            # Get thread-local Markdown engine
+            md_engine = self._get_md_engine()
             
-            # Add metadata header
-            metadata = f"""<!--
-Generated by 8-bit Mixed Precision Kosmos-2.5
-Model: {self.model_checkpoint}
-Quantization: {'8-bit' if self.use_8bit else 'FP16/BF16'}
-Mixed Precision: {self.mixed_precision}
-Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
--->
-
-"""
+            # Generate output path
+            output_file = Path(output_folders['markdown']) / f"{image_name}_document.md"
             
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(metadata + markdown_text)
+            logger.info(f"[Task {task_id}] Processing Markdown for: {Path(image_path).name}")
+            debug_memory_status()
             
-            logger.info(f"Markdown saved to: {output_path}")
-            debug_checkpoint("Markdown saved successfully", "SAVE_MD_END")
+            # Generate markdown with comprehensive error handling
+            result = md_engine.generate_markdown(
+                image_path=image_path,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                save_output=str(output_file)
+            )
+            
+            processing_time = time.time() - start_time
+            
+            # Extract comprehensive statistics
+            stats = result.get('statistics', {})
+            
+            success_result = {
+                'success': True,
+                'task_id': task_id,
+                'image_path': image_path,
+                'image_name': image_name,
+                'output_file': str(output_file),
+                'word_count': stats.get('word_count', 0),
+                'char_count': stats.get('char_count', 0),
+                'line_count': stats.get('line_count', 0),
+                'headers': stats.get('headers', 0),
+                'lists': stats.get('lists', 0),
+                'tables': stats.get('tables', 0),
+                'code_blocks': stats.get('code_blocks', 0),
+                'processing_time': processing_time,
+                'inference_time': result.get('inference_time', 0),
+                'quantization_used': '8-bit' if md_engine.use_8bit else 'FP16/BF16',
+                'markdown_length': len(result.get('markdown', '')),
+                'raw_output_length': len(result.get('raw_output', ''))
+            }
+            
+            debug_checkpoint(f"Markdown processing completed successfully for: {image_name}", f"MD_TASK_{task_id}_SUCCESS")
+            return success_result
             
         except Exception as e:
-            debug_checkpoint(f"Failed to save markdown: {str(e)}", "SAVE_MD_FAILED")
-            logger.error(f"Error saving markdown: {e}")
+            processing_time = time.time() - start_time
+            error_msg = f"Markdown generation failed for {Path(image_path).name}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Save detailed error information
+            error_file = Path(output_folders['errors']) / f"{image_name}_md_error.txt"
+            try:
+                with open(error_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Markdown Generation Error Report\n")
+                    f.write(f"{'='*50}\n")
+                    f.write(f"Image: {image_path}\n")
+                    f.write(f"Error: {str(e)}\n")
+                    f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Processing time: {processing_time:.2f}s\n\n")
+                    f.write(f"Full traceback:\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass  # Don't fail on error logging
+            
+            error_result = {
+                'success': False,
+                'task_id': task_id,
+                'image_path': image_path,
+                'image_name': image_name,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'processing_time': processing_time,
+                'error_file': str(error_file)
+            }
+            
+            debug_checkpoint(f"Markdown processing failed for: {image_name}", f"MD_TASK_{task_id}_FAILED")
+            return error_result
     
-    def batch_process(self, image_paths, output_dir, max_tokens=2048, temperature=0.1):
-        """Process multiple images in batch with progress tracking"""
-        debug_checkpoint(f"Starting batch processing of {len(image_paths)} images", "BATCH_START")
+    def process_batch_sequential(self, 
+                               image_paths: List[str],
+                               output_folders: Dict[str, str],
+                               process_ocr: bool,
+                               process_md: bool,
+                               max_tokens: int,
+                               temperature: float) -> Dict[str, Any]:
+        """Process images sequentially with detailed progress tracking"""
+        debug_checkpoint("Starting sequential batch processing", "BATCH_SEQ_START")
         
-        if self.model is None:
-            debug_checkpoint("Loading model for batch processing")
-            safe_execute(self.load_model, "Load model for batch")
+        results = {
+            'ocr_results': [],
+            'md_results': [],
+            'total_images': len(image_paths),
+            'start_time': time.time(),
+            'processing_mode': 'sequential'
+        }
         
-        results = []
-        os.makedirs(output_dir, exist_ok=True)
-        
-        logger.info(f"Starting batch markdown processing of {len(image_paths)} images...")
+        self.total_tasks = len(image_paths) * (int(process_ocr) + int(process_md))
+        self.completed_tasks = 0
         
         for i, image_path in enumerate(image_paths, 1):
-            debug_checkpoint(f"Processing batch image {i}/{len(image_paths)}: {os.path.basename(image_path)}")
-            logger.info(f"Processing image {i}/{len(image_paths)}: {os.path.basename(image_path)}")
+            image_name = Path(image_path).name
+            logger.info(f"Processing image {i}/{len(image_paths)}: {image_name}")
             
-            try:
-                # Generate output filename
-                base_name = os.path.splitext(os.path.basename(image_path))[0]
-                output_path = os.path.join(output_dir, f"{base_name}_markdown.md")
-                
-                # Generate markdown
-                result = safe_execute(self.generate_markdown, f"Markdown for {base_name}",
-                    image_path=image_path,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    save_output=output_path
+            # Process OCR if requested
+            if process_ocr:
+                debug_checkpoint(f"Processing OCR for image {i}: {image_name}")
+                ocr_result = self.process_single_image_ocr(
+                    image_path, output_folders, max_tokens, task_id=i
                 )
-                
-                result['input_path'] = image_path
-                result['output_path'] = output_path
-                results.append(result)
+                results['ocr_results'].append(ocr_result)
+                self.completed_tasks += 1
                 
                 # Progress update
-                progress = (i / len(image_paths)) * 100
-                logger.info(f"Progress: {progress:.1f}% ({i}/{len(image_paths)})")
-                debug_checkpoint(f"Batch progress: {progress:.1f}% completed")
+                progress = (self.completed_tasks / self.total_tasks) * 100
+                logger.info(f"Progress: {progress:.1f}% ({self.completed_tasks}/{self.total_tasks})")
+            
+            # Process Markdown if requested
+            if process_md:
+                debug_checkpoint(f"Processing Markdown for image {i}: {image_name}")
+                md_result = self.process_single_image_markdown(
+                    image_path, output_folders, max_tokens, temperature, task_id=i
+                )
+                results['md_results'].append(md_result)
+                self.completed_tasks += 1
                 
-            except Exception as e:
-                debug_checkpoint(f"Failed to process batch image {image_path}: {str(e)}")
-                logger.error(f"Failed to process {image_path}: {e}")
-                results.append({
-                    'input_path': image_path,
-                    'error': str(e),
-                    'inference_time': 0,
-                    'statistics': {}
-                })
+                # Progress update
+                progress = (self.completed_tasks / self.total_tasks) * 100
+                logger.info(f"Progress: {progress:.1f}% ({self.completed_tasks}/{self.total_tasks})")
         
-        logger.info("Batch markdown processing completed!")
-        debug_checkpoint("Batch processing completed", "BATCH_END")
+        results['end_time'] = time.time()
+        results['total_time'] = results['end_time'] - results['start_time']
+        
+        debug_checkpoint("Sequential batch processing completed", "BATCH_SEQ_END")
         return results
+    
+    def process_batch_parallel(self, 
+                             image_paths: List[str],
+                             output_folders: Dict[str, str],
+                             process_ocr: bool,
+                             process_md: bool,
+                             max_tokens: int,
+                             temperature: float) -> Dict[str, Any]:
+        """Process images in parallel with enhanced resource management"""
+        debug_checkpoint("Starting parallel batch processing", "BATCH_PAR_START")
+        
+        results = {
+            'ocr_results': [],
+            'md_results': [],
+            'total_images': len(image_paths),
+            'start_time': time.time(),
+            'processing_mode': 'parallel'
+        }
+        
+        self.total_tasks = len(image_paths) * (int(process_ocr) + int(process_md))
+        self.completed_tasks = 0
+        
+        # Choose executor type based on configuration
+        if self.use_process_pool:
+            executor_class = ProcessPoolExecutor
+            logger.info(f"Using ProcessPoolExecutor with {self.max_workers} workers")
+        else:
+            executor_class = ThreadPoolExecutor
+            logger.info(f"Using ThreadPoolExecutor with {self.max_workers} workers")
+        
+        with executor_class(max_workers=self.max_workers) as executor:
+            futures = []
+            task_id = 0
+            
+            # Submit OCR tasks
+            if process_ocr:
+                for image_path in image_paths:
+                    task_id += 1
+                    future = executor.submit(
+                        self.process_single_image_ocr,
+                        image_path, output_folders, max_tokens, task_id
+                    )
+                    futures.append(('ocr', future, task_id))
+            
+            # Submit Markdown tasks
+            if process_md:
+                for image_path in image_paths:
+                    task_id += 1
+                    future = executor.submit(
+                        self.process_single_image_markdown,
+                        image_path, output_folders, max_tokens, temperature, task_id
+                    )
+                    futures.append(('md', future, task_id))
+            
+            # Collect results with progress tracking
+            for task_type, future in as_completed([f[1] for f in futures]):
+                self.completed_tasks += 1
+                progress = (self.completed_tasks / self.total_tasks) * 100
+                logger.info(f"Completed task {self.completed_tasks}/{self.total_tasks} ({progress:.1f}%)")
+                
+                try:
+                    result = future.result()
+                    if task_type == 'ocr':
+                        results['ocr_results'].append(result)
+                    else:
+                        results['md_results'].append(result)
+                        
+                    # Log success/failure
+                    if result.get('success', False):
+                        logger.info(f"✓ {task_type.upper()} task completed: {result.get('image_name', 'unknown')}")
+                    else:
+                        logger.error(f"✗ {task_type.upper()} task failed: {result.get('image_name', 'unknown')} - {result.get('error', 'unknown error')}")
+                        
+                except Exception as e:
+                    logger.error(f"Task execution failed: {e}")
+        
+        results['end_time'] = time.time()
+        results['total_time'] = results['end_time'] - results['start_time']
+        
+        debug_checkpoint("Parallel batch processing completed", "BATCH_PAR_END")
+        return results
+    
+    def create_performance_report(self, 
+                                results: Dict[str, Any], 
+                                output_folders: Dict[str, str]) -> str:
+        """Create detailed performance analysis report"""
+        debug_checkpoint("Creating performance report", "PERF_REPORT_START")
+        
+        performance_file = Path(output_folders['performance']) / "performance_analysis.json"
+        
+        # Extract performance metrics
+        ocr_results = results.get('ocr_results', [])
+        md_results = results.get('md_results', [])
+        
+        ocr_successful = [r for r in ocr_results if r.get('success', False)]
+        md_successful = [r for r in md_results if r.get('success', False)]
+        
+        # Calculate performance statistics
+        performance_data = {
+            'system_info': self.system_info,
+            'configuration': {
+                'model_checkpoint': self.model_checkpoint,
+                'is_local_checkpoint': self.is_local_checkpoint,
+                'use_8bit': self.use_8bit,
+                'mixed_precision': self.mixed_precision,
+                'force_fallback': self.force_fallback,
+                'max_workers': self.max_workers,
+                'use_process_pool': self.use_process_pool,
+                'processing_mode': results.get('processing_mode', 'unknown')
+            },
+            'timing_analysis': {
+                'total_processing_time': results.get('total_time', 0),
+                'images_processed': results.get('total_images', 0),
+                'average_time_per_image': results.get('total_time', 0) / max(results.get('total_images', 1), 1),
+                'ocr_processing_times': [r.get('processing_time', 0) for r in ocr_successful],
+                'md_processing_times': [r.get('processing_time', 0) for r in md_successful],
+                'ocr_inference_times': [r.get('inference_time', 0) for r in ocr_successful],
+                'md_inference_times': [r.get('inference_time', 0) for r in md_successful]
+            },
+            'quantization_analysis': {
+                'ocr_quantization_used': [r.get('quantization_used', 'unknown') for r in ocr_successful],
+                'md_quantization_used': [r.get('quantization_used', 'unknown') for r in md_successful],
+            },
+            'error_analysis': {
+                'ocr_errors': [r for r in ocr_results if not r.get('success', False)],
+                'md_errors': [r for r in md_results if not r.get('success', False)],
+                'ocr_error_rate': len([r for r in ocr_results if not r.get('success', False)]) / max(len(ocr_results), 1),
+                'md_error_rate': len([r for r in md_results if not r.get('success', False)]) / max(len(md_results), 1)
+            },
+            'throughput_metrics': {
+                'images_per_second': results.get('total_images', 0) / max(results.get('total_time', 1), 1),
+                'ocr_regions_per_second': sum(r.get('text_regions', 0) for r in ocr_successful) / max(results.get('total_time', 1), 1),
+                'md_words_per_second': sum(r.get('word_count', 0) for r in md_successful) / max(results.get('total_time', 1), 1)
+            }
+        }
+        
+        # Save performance report
+        with open(performance_file, 'w', encoding='utf-8') as f:
+            json.dump(performance_data, f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.info(f"Performance analysis saved to: {performance_file}")
+        debug_checkpoint("Performance report creation completed", "PERF_REPORT_END")
+        
+        return str(performance_file)
+    
+    def create_comprehensive_report(self, 
+                                  results: Dict[str, Any], 
+                                  output_folders: Dict[str, str],
+                                  config: Dict[str, Any]) -> str:
+        """Create comprehensive processing report with detailed analysis"""
+        debug_checkpoint("Creating comprehensive report", "COMP_REPORT_START")
+        
+        report_file = Path(output_folders['reports']) / "comprehensive_processing_report.json"
+        
+        # Extract results
+        ocr_results = results.get('ocr_results', [])
+        md_results = results.get('md_results', [])
+        
+        ocr_successful = [r for r in ocr_results if r.get('success', False)]
+        ocr_failed = [r for r in ocr_results if not r.get('success', False)]
+        md_successful = [r for r in md_results if r.get('success', False)]
+        md_failed = [r for r in md_results if not r.get('success', False)]
+        
+        # Calculate comprehensive statistics
+        total_text_regions = sum(r.get('text_regions', 0) for r in ocr_successful)
+        total_words = sum(r.get('word_count', 0) for r in md_successful)
+        total_chars = sum(r.get('char_count', 0) for r in md_successful)
+        
+        # Create comprehensive report
+        report = {
+            'metadata': {
+                'report_generated': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'processor_version': '8-bit Mixed Precision Batch Processor v1.0',
+                'system_info': self.system_info
+            },
+            'configuration': config,
+            'processing_summary': {
+                'total_images': results['total_images'],
+                'total_processing_time': results['total_time'],
+                'average_time_per_image': results['total_time'] / max(results['total_images'], 1),
+                'processing_mode': results.get('processing_mode', 'unknown'),
+                'tasks_completed': len(ocr_results) + len(md_results),
+                'overall_success_rate': len(ocr_successful + md_successful) / max(len(ocr_results + md_results), 1)
+            },
+            'ocr_analysis': {
+                'total_processed': len(ocr_results),
+                'successful': len(ocr_successful),
+                'failed': len(ocr_failed),
+                'success_rate': len(ocr_successful) / max(len(ocr_results), 1),
+                'total_text_regions_found': total_text_regions,
+                'average_regions_per_image': total_text_regions / max(len(ocr_successful), 1),
+                'average_processing_time': sum(r.get('processing_time', 0) for r in ocr_successful) / max(len(ocr_successful), 1),
+                'average_inference_time': sum(r.get('inference_time', 0) for r in ocr_successful) / max(len(ocr_successful), 1),
+                'quantization_distribution': {},
+                'error_types': {}
+            },
+            'markdown_analysis': {
+                'total_processed': len(md_results),
+                'successful': len(md_successful),
+                'failed': len(md_failed),
+                'success_rate': len(md_successful) / max(len(md_results), 1),
+                'total_words_generated': total_words,
+                'total_characters_generated': total_chars,
+                'average_words_per_image': total_words / max(len(md_successful), 1),
+                'average_processing_time': sum(r.get('processing_time', 0) for r in md_successful) / max(len(md_successful), 1),
+                'average_inference_time': sum(r.get('inference_time', 0) for r in md_successful) / max(len(md_successful), 1),
+                'content_analysis': {
+                    'total_headers': sum(r.get('headers', 0) for r in md_successful),
+                    'total_lists': sum(r.get('lists', 0) for r in md_successful),
+                    'total_tables': sum(r.get('tables', 0) for r in md_successful),
+                    'total_code_blocks': sum(r.get('code_blocks', 0) for r in md_successful)
+                },
+                'quantization_distribution': {},
+                'error_types': {}
+            },
+            'detailed_results': {
+                'ocr_results': ocr_results,
+                'markdown_results': md_results
+            }
+        }
+        
+        # Analyze quantization usage
+        for r in ocr_successful:
+            quant = r.get('quantization_used', 'unknown')
+            report['ocr_analysis']['quantization_distribution'][quant] = report['ocr_analysis']['quantization_distribution'].get(quant, 0) + 1
+        
+        for r in md_successful:
+            quant = r.get('quantization_used', 'unknown')
+            report['markdown_analysis']['quantization_distribution'][quant] = report['markdown_analysis']['quantization_distribution'].get(quant, 0) + 1
+        
+        # Analyze error types
+        for r in ocr_failed:
+            error_type = r.get('error_type', 'unknown')
+            report['ocr_analysis']['error_types'][error_type] = report['ocr_analysis']['error_types'].get(error_type, 0) + 1
+        
+        for r in md_failed:
+            error_type = r.get('error_type', 'unknown')
+            report['markdown_analysis']['error_types'][error_type] = report['markdown_analysis']['error_types'].get(error_type, 0) + 1
+        
+        # Save comprehensive report
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.info(f"Comprehensive report saved to: {report_file}")
+        debug_checkpoint("Comprehensive report creation completed", "COMP_REPORT_END")
+        
+        return str(report_file)
+    
+    def print_detailed_summary(self, results: Dict[str, Any], config: Dict[str, Any]):
+        """Print detailed, formatted summary of processing results"""
+        debug_checkpoint("Generating detailed summary", "SUMMARY_START")
+        
+        ocr_results = results.get('ocr_results', [])
+        md_results = results.get('md_results', [])
+        
+        ocr_successful = [r for r in ocr_results if r.get('success', False)]
+        md_successful = [r for r in md_results if r.get('success', False)]
+        
+        total_text_regions = sum(r.get('text_regions', 0) for r in ocr_successful)
+        total_words = sum(r.get('word_count', 0) for r in md_successful)
+        
+        # Print comprehensive summary
+        print(f"\n{'='*100}")
+        print("8-BIT MIXED PRECISION BATCH PROCESSING SUMMARY")
+        print(f"{'='*100}")
+        
+        print(f"\n📋 CONFIGURATION:")
+        print(f"  Model Checkpoint: {config['model_checkpoint']}")
+        print(f"  Local Model: {'Yes' if self.is_local_checkpoint else 'No'}")
+        print(f"  Device: {config['device'] or 'Auto-detected'}")
+        print(f"  8-bit Quantization: {'Enabled' if config['use_8bit'] else 'Disabled'}")
+        print(f"  Mixed Precision: {'Enabled' if config['mixed_precision'] else 'Disabled'}")
+        print(f"  Force Fallback: {'Yes' if config['force_fallback'] else 'No'}")
+        print(f"  Max Workers: {config['max_workers']}")
+        print(f"  Processing Mode: {results.get('processing_mode', 'Unknown').title()}")
+        print(f"  Executor Type: {'Process Pool' if self.use_process_pool else 'Thread Pool'}")
+        
+        print(f"\n⏱️  PERFORMANCE METRICS:")
+        print(f"  Total Images: {results['total_images']}")
+        print(f"  Total Processing Time: {results['total_time']:.2f}s")
+        print(f"  Average Time per Image: {results['total_time']/max(results['total_images'], 1):.2f}s")
+        print(f"  Images per Second: {results['total_images']/max(results['total_time'], 1):.2f}")
+        
+        if ocr_results:
+            print(f"\n🔍 OCR PROCESSING RESULTS:")
+            print(f"  Total Processed: {len(ocr_results)}")
+            print(f"  Successful: {len(ocr_successful)}")
+            print(f"  Failed: {len(ocr_results) - len(ocr_successful)}")
+            print(f"  Success Rate: {(len(ocr_successful)/max(len(ocr_results), 1))*100:.1f}%")
+            print(f"  Total Text Regions Found: {total_text_regions:,}")
+            print(f"  Average Regions per Image: {total_text_regions/max(len(ocr_successful), 1):.1f}")
+            
+            if ocr_successful:
+                avg_proc_time = sum(r.get('processing_time', 0) for r in ocr_successful) / len(ocr_successful)
+                avg_inf_time = sum(r.get('inference_time', 0) for r in ocr_successful) / len(ocr_successful)
+                print(f"  Average Processing Time: {avg_proc_time:.2f}s")
+                print(f"  Average Inference Time: {avg_inf_time:.2f}s")
+                
+                # Quantization usage
+                quant_usage = {}
+                for r in ocr_successful:
+                    quant = r.get('quantization_used', 'unknown')
+                    quant_usage[quant] = quant_usage.get(quant, 0) + 1
+                print(f"  Quantization Usage: {dict(quant_usage)}")
+        
+        if md_results:
+            print(f"\n📝 MARKDOWN GENERATION RESULTS:")
+            print(f"  Total Processed: {len(md_results)}")
+            print(f"  Successful: {len(md_successful)}")
+            print(f"  Failed: {len(md_results) - len(md_successful)}")
+            print(f"  Success Rate: {(len(md_successful)/max(len(md_results), 1))*100:.1f}%")
+            print(f"  Total Words Generated: {total_words:,}")
+            print(f"  Average Words per Image: {total_words/max(len(md_successful), 1):.0f}")
+            
+            if md_successful:
+                total_headers = sum(r.get('headers', 0) for r in md_successful)
+                total_lists = sum(r.get('lists', 0) for r in md_successful)
+                total_tables = sum(r.get('tables', 0) for r in md_successful)
+                total_code_blocks = sum(r.get('code_blocks', 0) for r in md_successful)
+                
+                avg_proc_time = sum(r.get('processing_time', 0) for r in md_successful) / len(md_successful)
+                avg_inf_time = sum(r.get('inference_time', 0) for r in md_successful) / len(md_successful)
+                print(f"  Average Processing Time: {avg_proc_time:.2f}s")
+                print(f"  Average Inference Time: {avg_inf_time:.2f}s")
+                print(f"  Content Elements:")
+                print(f"    Headers: {total_headers}")
+                print(f"    Lists: {total_lists}")
+                print(f"    Tables: {total_tables}")
+                print(f"    Code Blocks: {total_code_blocks}")
+                
+                # Quantization usage
+                quant_usage = {}
+                for r in md_successful:
+                    quant = r.get('quantization_used', 'unknown')
+                    quant_usage[quant] = quant_usage.get(quant, 0) + 1
+                print(f"  Quantization Usage: {dict(quant_usage)}")
+        
+        # System information
+        if self.system_info:
+            print(f"\n💻 SYSTEM INFORMATION:")
+            print(f"  CPU Cores: {self.system_info.get('cpu_count', 'Unknown')} physical, {self.system_info.get('cpu_count_logical', 'Unknown')} logical")
+            print(f"  System Memory: {self.system_info.get('memory_total_gb', 0):.1f} GB")
+            print(f"  CUDA Available: {'Yes' if self.system_info.get('cuda_available', False) else 'No'}")
+            if self.system_info.get('cuda_available', False):
+                print(f"  CUDA Devices: {self.system_info.get('cuda_device_count', 0)}")
+                print(f"  GPU Memory: {self.system_info.get('cuda_memory_gb', 0):.1f} GB")
+        
+        print(f"\n{'='*100}")
+        
+        debug_checkpoint("Detailed summary generation completed", "SUMMARY_END")
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 with Enhanced Debugging - FINAL DEVICE FIX')
-    parser.add_argument('--image', '-i', type=str, required=True,
-                       help='Path to input image file or URL')
+    """Parse command line arguments with comprehensive options"""
+    parser = argparse.ArgumentParser(
+        description='8-bit Mixed Precision Batch Processor for Kosmos-2.5 with Complete Device Management',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Input/Output arguments - FIXED: Changed --input_folder to --input to match error message
+    parser.add_argument('--input', '-i', type=str, required=True,
+                       help='Path to input folder containing images')
+    parser.add_argument('--output', '-o', type=str, required=True,
+                       help='Path to output folder for results')
+    
+    # Model configuration
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
                        help='Path to model checkpoint (local directory or HuggingFace model name)')
-    parser.add_argument('--output', '-o', type=str, default='./output.md',
-                       help='Output path for generated markdown')
-    parser.add_argument('--device', '-d', type=str, default=None,
-                       help='Device to use (auto-detected if not specified)')
-    parser.add_argument('--max_tokens', type=int, default=2048,
-                       help='Maximum tokens to generate')
-    parser.add_argument('--temperature', '-t', type=float, default=0.1,
-                       help='Sampling temperature (0 for deterministic)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
+    
+    # Quantization and precision settings
     parser.add_argument('--no_8bit', action='store_true',
                        help='Disable 8-bit quantization')
     parser.add_argument('--no_mixed_precision', action='store_true',
                        help='Disable mixed precision for critical layers')
-    parser.add_argument('--batch', action='store_true',
-                       help='Process multiple images (image should be a directory)')
-    parser.add_argument('--print_output', '-p', action='store_true',
-                       help='Print generated markdown to console')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Enable verbose output with statistics')
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable maximum debug output')
     parser.add_argument('--force_fallback', action='store_true',
                        help='Force use of fallback mode (no 8-bit quantization)')
+    
+    # Processing configuration
+    parser.add_argument('--device', '-d', type=str, default=None,
+                       help='Device to use (auto-detected if not specified)')
+    parser.add_argument('--max_tokens', type=int, default=1024,
+                       help='Maximum number of tokens to generate')
+    parser.add_argument('--temperature', '-t', type=float, default=0.1,
+                       help='Sampling temperature for markdown generation')
+    
+    # Task selection
+    parser.add_argument('--skip_ocr', action='store_true',
+                       help='Skip OCR processing')
+    parser.add_argument('--skip_md', action='store_true',
+                       help='Skip markdown generation')
+    
+    # Performance configuration
+    parser.add_argument('--max_workers', type=int, default=1,
+                       help='Maximum number of parallel workers (1 for sequential)')
+    parser.add_argument('--parallel', action='store_true',
+                       help='Enable parallel processing (requires max_workers > 1)')
+    parser.add_argument('--use_process_pool', action='store_true',
+                       help='Use process pool instead of thread pool for true parallelism')
+    
+    # File handling
+    parser.add_argument('--image_extensions', type=str, nargs='+', 
+                       default=['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'],
+                       help='Image file extensions to process')
+    
+    # Debug and logging
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable maximum debug output')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output')
     
     return parser.parse_args()
 
 def main():
-    debug_checkpoint("Application starting", "MAIN_START")
+    """Main execution function with comprehensive error handling"""
+    debug_checkpoint("8-bit Mixed Precision Batch Processor starting", "MAIN_START")
     
     args = get_args()
     
-    # Set logging level
+    # Set logging level based on arguments
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         debug_checkpoint("Debug mode enabled")
@@ -836,115 +909,99 @@ def main():
         logging.getLogger().setLevel(logging.INFO)
         debug_checkpoint("Verbose mode enabled")
     
-    debug_checkpoint(f"Arguments: {vars(args)}")
+    # Validate arguments
+    if args.skip_ocr and args.skip_md:
+        logger.error("Cannot skip both OCR and markdown processing")
+        sys.exit(1)
     
-    # Initialize 8-bit mixed precision markdown inference
-    debug_checkpoint("Initializing markdown engine")
-    md_engine = safe_execute(EightBitMarkdownInference, "Initialize markdown engine",
-        model_checkpoint=args.model_checkpoint,
-        device=args.device,
-        cache_dir=args.cache_dir,
-        use_8bit=not args.no_8bit,
-        mixed_precision=not args.no_mixed_precision,
-        force_fallback=args.force_fallback
-    )
+    if args.parallel and args.max_workers <= 1:
+        logger.warning("Parallel processing requested but max_workers <= 1. Using sequential processing.")
+        args.parallel = False
+    
+    # Create configuration dict - FIXED: Updated to use args.input and args.output
+    config = {
+        'model_checkpoint': args.model_checkpoint,
+        'cache_dir': args.cache_dir,
+        'device': args.device,
+        'use_8bit': not args.no_8bit,
+        'mixed_precision': not args.no_mixed_precision,
+        'force_fallback': args.force_fallback,
+        'max_tokens': args.max_tokens,
+        'temperature': args.temperature,
+        'max_workers': args.max_workers,
+        'parallel': args.parallel,
+        'use_process_pool': args.use_process_pool,
+        'process_ocr': not args.skip_ocr,
+        'process_md': not args.skip_md,
+        'image_extensions': args.image_extensions
+    }
+    
+    debug_checkpoint(f"Configuration: {config}")
     
     try:
-        if args.batch and os.path.isdir(args.image):
-            debug_checkpoint("Starting batch processing mode")
-            # Batch processing
-            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
-            image_paths = [
-                os.path.join(args.image, f) for f in os.listdir(args.image)
-                if any(f.lower().endswith(ext) for ext in image_extensions)
-            ]
-            
-            if not image_paths:
-                debug_checkpoint("No images found in batch directory")
-                logger.error(f"No images found in directory: {args.image}")
-                sys.exit(1)
-            
-            debug_checkpoint(f"Found {len(image_paths)} images for batch processing")
-            logger.info(f"Processing {len(image_paths)} images in batch mode")
-            
-            results = safe_execute(md_engine.batch_process, "Batch process images",
-                image_paths=image_paths,
-                output_dir=args.output,  # Use as output directory
-                max_tokens=args.max_tokens,
-                temperature=args.temperature
+        # Initialize batch processor
+        debug_checkpoint("Initializing 8-bit batch processor")
+        processor = EightBitBatchProcessor(
+            model_checkpoint=args.model_checkpoint,
+            device=args.device,
+            cache_dir=args.cache_dir,
+            use_8bit=not args.no_8bit,
+            mixed_precision=not args.no_mixed_precision,
+            force_fallback=args.force_fallback,
+            max_workers=args.max_workers,
+            use_process_pool=args.use_process_pool
+        )
+        
+        # Find images - FIXED: Updated to use args.input
+        logger.info(f"Scanning for images in: {args.input}")
+        image_files = processor.find_images(args.input, args.image_extensions)
+        
+        if not image_files:
+            logger.error(f"No valid images found in {args.input}")
+            sys.exit(1)
+        
+        # Create output structure - FIXED: Updated to use args.output
+        output_folders = processor.create_output_structure(args.output)
+        
+        # Process images
+        logger.info(f"Starting 8-bit mixed precision batch processing of {len(image_files)} images")
+        logger.info(f"Processing mode: {'Parallel' if args.parallel else 'Sequential'}")
+        
+        if args.parallel:
+            results = processor.process_batch_parallel(
+                image_files, output_folders,
+                not args.skip_ocr, not args.skip_md,
+                args.max_tokens, args.temperature
             )
-            
-            # Calculate batch statistics
-            debug_checkpoint("Calculating batch statistics")
-            successful = sum(1 for r in results if 'error' not in r)
-            total_time = sum(r.get('inference_time', 0) for r in results)
-            total_words = sum(r.get('statistics', {}).get('word_count', 0) for r in results if 'error' not in r)
-            total_headers = sum(r.get('statistics', {}).get('headers', 0) for r in results if 'error' not in r)
-            total_lists = sum(r.get('statistics', {}).get('lists', 0) for r in results if 'error' not in r)
-            
-            print(f"\n{'='*80}")
-            print("BATCH MARKDOWN PROCESSING SUMMARY (8-BIT MIXED PRECISION)")
-            print(f"{'='*80}")
-            print(f"Total images processed: {len(results)}")
-            print(f"Successful: {successful}")
-            print(f"Failed: {len(results) - successful}")
-            print(f"Total words generated: {total_words:,}")
-            print(f"Total headers found: {total_headers}")
-            print(f"Total list items: {total_lists}")
-            print(f"Total processing time: {total_time:.2f}s")
-            print(f"Average time per image: {total_time/len(results):.2f}s")
-            print(f"Average words per image: {total_words/successful:.0f}" if successful > 0 else "N/A")
-            print(f"Model checkpoint: {args.model_checkpoint}")
-            print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
-            print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
-            print(f"Output directory: {args.output}")
-            print(f"{'='*80}")
-            
         else:
-            debug_checkpoint("Starting single image processing mode")
-            # Single image processing
-            result = safe_execute(md_engine.generate_markdown, "Generate markdown for single image",
-                image_path=args.image,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                save_output=args.output
+            results = processor.process_batch_sequential(
+                image_files, output_folders,
+                not args.skip_ocr, not args.skip_md,
+                args.max_tokens, args.temperature
             )
-            
-            stats = result['statistics']
-            
-            # Print results summary
-            print(f"\n{'='*80}")
-            print("MARKDOWN GENERATION SUMMARY (8-BIT MIXED PRECISION)")
-            print(f"{'='*80}")
-            print(f"Processing time: {result['inference_time']:.2f}s")
-            print(f"Word count: {stats['word_count']:,}")
-            print(f"Character count: {stats['char_count']:,}")
-            print(f"Line count: {stats['line_count']:,}")
-            print(f"Headers: {stats['headers']}")
-            print(f"List items: {stats['lists']}")
-            print(f"Tables: {stats['tables']}")
-            print(f"Code blocks: {stats['code_blocks']}")
-            print(f"Output saved to: {args.output}")
-            print(f"Model checkpoint: {args.model_checkpoint}")
-            print(f"Quantization: {'8-bit' if not args.no_8bit and not args.force_fallback else 'FP16/BF16'}")
-            print(f"Mixed precision: {'Enabled' if not args.no_mixed_precision else 'Disabled'}")
-            print(f"{'='*80}")
-            
-            if args.print_output:
-                print("\nGENERATED MARKDOWN:")
-                print("=" * 80)
-                print(result['markdown'])
-                print("=" * 80)
+        
+        # Create reports
+        debug_checkpoint("Generating reports")
+        comprehensive_report = processor.create_comprehensive_report(results, output_folders, config)
+        performance_report = processor.create_performance_report(results, output_folders)
+        
+        # Print summary
+        processor.print_detailed_summary(results, config)
+        
+        logger.info(f"8-bit mixed precision batch processing completed successfully!")
+        logger.info(f"Comprehensive report: {comprehensive_report}")
+        logger.info(f"Performance analysis: {performance_report}")
         
         debug_checkpoint("Application completed successfully", "MAIN_END")
         
+    except KeyboardInterrupt:
+        logger.info("Processing interrupted by user")
+        debug_checkpoint("Application interrupted by user", "MAIN_INTERRUPTED")
+        sys.exit(1)
     except Exception as e:
+        logger.error(f"Batch processing failed: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         debug_checkpoint(f"Application failed with error: {str(e)}", "MAIN_FAILED")
-        logger.error(f"Markdown generation failed: {e}")
-        if args.verbose or args.debug:
-            logger.error(f"Full traceback: {tb_module.format_exc()}")
-            import traceback
-            traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
