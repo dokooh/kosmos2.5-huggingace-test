@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
+# filepath: c:\SAI\IA\unilm\kosmos-2.5\md_fp8_mixed.py
 """
-8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - FINAL DEVICE FIX
+8-bit Mixed Precision Markdown Generation for Kosmos-2.5 with Enhanced Debugging - CUDA ERROR FIX
 
 This module provides fast markdown generation using 8-bit mixed precision quantized Kosmos-2.5 model.
 Features:
-- 8-bit mixed precision quantization for faster inference and reduced memory usage
+- 8-bit mixed precision quantization with faster inference and reduced memory usage
 - BitsAndBytesConfig for advanced quantization settings
 - SafeTensors format support for faster loading
 - Support for local model checkpoints and remote models
@@ -13,7 +14,7 @@ Features:
 - Batch processing support with progress tracking
 - Comprehensive error handling and fallback mechanisms
 - EXTENSIVE DEBUGGING OUTPUT TO IDENTIFY STOPPING POINTS
-- FINAL FIX: Complete device placement solution for 8-bit quantization
+- CUDA ERROR FIX: Enhanced tensor validation and device placement
 """
 
 import torch
@@ -67,13 +68,77 @@ def debug_memory_status():
         debug_checkpoint("CUDA not available")
 
 def debug_tensor_devices(tensor_dict, name="Tensors"):
-    """Debug tensor device placement"""
+    """Debug tensor device placement with enhanced validation"""
     debug_checkpoint(f"Checking {name} device placement:")
     for key, tensor in tensor_dict.items():
         if isinstance(tensor, torch.Tensor):
-            debug_checkpoint(f"  {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
+            try:
+                # Check for invalid values
+                has_nan = torch.isnan(tensor).any()
+                has_inf = torch.isinf(tensor).any()
+                min_val = tensor.min().item() if tensor.numel() > 0 else 0
+                max_val = tensor.max().item() if tensor.numel() > 0 else 0
+                
+                debug_checkpoint(f"  {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
+                debug_checkpoint(f"    Range: [{min_val:.6f}, {max_val:.6f}], NaN: {has_nan}, Inf: {has_inf}")
+                
+                # Warn about problematic values
+                if has_nan:
+                    debug_checkpoint(f"    WARNING: Tensor {key} contains NaN values!")
+                if has_inf:
+                    debug_checkpoint(f"    WARNING: Tensor {key} contains infinite values!")
+                    
+            except Exception as e:
+                debug_checkpoint(f"  {key}: Error checking tensor - {e}")
         else:
             debug_checkpoint(f"  {key}: {type(tensor)} (not a tensor)")
+
+def validate_and_fix_tensors(tensor_dict, device):
+    """Validate and fix tensor issues that could cause CUDA errors"""
+    debug_checkpoint("Validating and fixing tensor issues", "TENSOR_FIX_START")
+    
+    fixed_tensors = {}
+    for key, tensor in tensor_dict.items():
+        if isinstance(tensor, torch.Tensor):
+            try:
+                # Check and fix NaN/Inf values
+                if torch.isnan(tensor).any():
+                    debug_checkpoint(f"Fixing NaN values in {key}")
+                    tensor = torch.nan_to_num(tensor, nan=0.0)
+                
+                if torch.isinf(tensor).any():
+                    debug_checkpoint(f"Fixing infinite values in {key}")
+                    tensor = torch.nan_to_num(tensor, posinf=1.0, neginf=-1.0)
+                
+                # Ensure tensor is on correct device
+                if tensor.device.type != device.split(':')[0]:
+                    debug_checkpoint(f"Moving {key} from {tensor.device} to {device}")
+                    tensor = tensor.to(device)
+                
+                # For attention masks, ensure values are 0 or 1
+                if 'attention_mask' in key.lower():
+                    debug_checkpoint(f"Validating attention mask {key}")
+                    # Clamp to valid range and ensure proper dtype
+                    tensor = torch.clamp(tensor, 0, 1).long()
+                    debug_checkpoint(f"Attention mask {key} clamped and converted to long")
+                
+                # For input_ids, ensure they're within vocabulary range
+                if 'input_ids' in key.lower():
+                    debug_checkpoint(f"Validating input_ids {key}")
+                    # Ensure no negative values
+                    tensor = torch.clamp(tensor, min=0)
+                    debug_checkpoint(f"Input_ids {key} clamped to non-negative")
+                
+                fixed_tensors[key] = tensor
+                
+            except Exception as e:
+                debug_checkpoint(f"Error fixing tensor {key}: {e}")
+                fixed_tensors[key] = tensor  # Use original if fixing fails
+        else:
+            fixed_tensors[key] = tensor
+    
+    debug_checkpoint("Tensor validation and fixing completed", "TENSOR_FIX_END")
+    return fixed_tensors
 
 def move_to_device_safe(data, device, dtype=None):
     """Safely move data to device with proper error handling"""
@@ -117,6 +182,12 @@ def tensor_to_float(tensor_val):
         return float(tensor_val.item())
     return float(tensor_val)
 
+def enable_cuda_debugging():
+    """Enable CUDA debugging environment variables"""
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    os.environ['TORCH_USE_CUDA_DSA'] = '1'
+    debug_checkpoint("Enabled CUDA debugging environment variables")
+
 class EightBitMarkdownInference:
     def __init__(self, model_checkpoint, device=None, cache_dir=None, use_8bit=True, mixed_precision=True, force_fallback=False):
         """
@@ -131,6 +202,9 @@ class EightBitMarkdownInference:
             force_fallback (bool): Force use of fallback mode (no 8-bit)
         """
         debug_checkpoint("Initializing EightBitMarkdownInference", "INIT_START")
+        
+        # Enable CUDA debugging
+        enable_cuda_debugging()
         
         self.model_checkpoint = model_checkpoint
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -430,6 +504,11 @@ class EightBitMarkdownInference:
             # Convert to RGB and validate
             debug_checkpoint("Converting image to RGB")
             image = image.convert('RGB')
+            
+            # Validate image size
+            if image.size[0] < 1 or image.size[1] < 1:
+                raise ValueError(f"Invalid image size: {image.size}")
+            
             logger.info(f"Image loaded successfully. Size: {image.size}")
             debug_checkpoint(f"Image conversion completed. Size: {image.size}", "IMAGE_LOAD_END")
             return image
@@ -545,7 +624,7 @@ class EightBitMarkdownInference:
         return text
     
     def generate_markdown(self, image_path, max_tokens=2048, temperature=0.1, save_output=None):
-        """Generate markdown from image using 8-bit mixed precision"""
+        """Generate markdown from image using 8-bit mixed precision with enhanced CUDA error handling"""
         debug_checkpoint("Starting markdown generation", "MD_START")
         
         if self.model is None:
@@ -578,28 +657,23 @@ class EightBitMarkdownInference:
             
             debug_checkpoint("Input processing completed", "PROCESS_INPUTS_END")
             
-            # FINAL DEVICE PLACEMENT FIX
-            debug_checkpoint("Moving inputs to device", "DEVICE_MOVE_START")
+            # ENHANCED DEVICE PLACEMENT AND TENSOR VALIDATION
+            debug_checkpoint("Moving inputs to device with validation", "DEVICE_MOVE_START")
             debug_memory_status()
             
             # Get model device (where the first parameter is located)
             model_device = next(self.model.parameters()).device
             debug_checkpoint(f"Model is on device: {model_device}")
             
-            # Move all inputs to the same device as the model
-            debug_checkpoint("Moving all inputs to model device")
-            for key in inputs:
-                if isinstance(inputs[key], torch.Tensor):
-                    old_device = inputs[key].device
-                    inputs[key] = inputs[key].to(model_device)
-                    debug_checkpoint(f"Moved {key} from {old_device} to {inputs[key].device}")
+            # Validate and fix tensors before moving to device
+            inputs = validate_and_fix_tensors(inputs, str(model_device))
             
             # Final device verification
-            debug_tensor_devices(inputs, "Final processed inputs")
-            debug_checkpoint("Device move completed", "DEVICE_MOVE_END")
+            debug_tensor_devices(inputs, "Final processed and validated inputs")
+            debug_checkpoint("Device move and validation completed", "DEVICE_MOVE_END")
             debug_memory_status()
             
-            # Generate markdown
+            # Generate markdown with enhanced error handling
             debug_checkpoint("Starting markdown inference generation", "GENERATION_START")
             logger.info("Generating markdown with 8-bit mixed precision...")
             
@@ -612,9 +686,9 @@ class EightBitMarkdownInference:
                     torch.cuda.empty_cache()
                     debug_memory_status()
                 
-                # Enhanced generation with better error handling
+                # Enhanced generation with better error handling and smaller max_length for stability
                 generation_kwargs = {
-                    "max_new_tokens": max_tokens,
+                    "max_new_tokens": min(max_tokens, 1024),  # Limit for stability
                     "do_sample": temperature > 0,
                     "temperature": temperature if temperature > 0 else None,
                     "pad_token_id": self.processor.tokenizer.eos_token_id,
@@ -624,27 +698,65 @@ class EightBitMarkdownInference:
                     "use_cache": True,
                     "num_beams": 1,
                     "early_stopping": True,
+                    "output_attentions": False,  # Disable to save memory
+                    "output_hidden_states": False,  # Disable to save memory
+                    "return_dict_in_generate": False,  # Simplify output
                 }
                 
                 debug_checkpoint(f"Generation kwargs: {generation_kwargs}")
                 
-                # Use mixed precision if enabled and not using 8-bit quantization
-                if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
-                    debug_checkpoint("Using mixed precision autocast")
-                    with torch.cuda.amp.autocast(dtype=self.dtype):
-                        debug_checkpoint("Inside autocast context, calling model.generate")
+                try:
+                    # Use mixed precision if enabled and not using 8-bit quantization
+                    if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
+                        debug_checkpoint("Using mixed precision autocast")
+                        with torch.cuda.amp.autocast(dtype=self.dtype):
+                            debug_checkpoint("Inside autocast context, calling model.generate")
+                            generated_ids = self.model.generate(
+                                **inputs,
+                                **generation_kwargs
+                            )
+                            debug_checkpoint("model.generate completed with autocast")
+                    else:
+                        debug_checkpoint("Using standard generation (no autocast)")
                         generated_ids = self.model.generate(
                             **inputs,
                             **generation_kwargs
                         )
-                        debug_checkpoint("model.generate completed with autocast")
-                else:
-                    debug_checkpoint("Using standard generation (no autocast)")
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        **generation_kwargs
-                    )
-                    debug_checkpoint("model.generate completed without autocast")
+                        debug_checkpoint("model.generate completed without autocast")
+                        
+                except RuntimeError as cuda_error:
+                    if "CUDA error" in str(cuda_error):
+                        debug_checkpoint(f"CUDA error detected: {cuda_error}")
+                        debug_checkpoint("Attempting fallback generation with reduced settings")
+                        
+                        # Try with even more conservative settings
+                        fallback_kwargs = {
+                            "max_new_tokens": min(max_tokens // 2, 512),
+                            "do_sample": False,  # Disable sampling
+                            "pad_token_id": self.processor.tokenizer.eos_token_id,
+                            "eos_token_id": self.processor.tokenizer.eos_token_id,
+                            "use_cache": False,  # Disable cache
+                            "num_beams": 1,
+                            "early_stopping": True,
+                            "output_attentions": False,
+                            "output_hidden_states": False,
+                            "return_dict_in_generate": False,
+                        }
+                        
+                        debug_checkpoint(f"Fallback generation kwargs: {fallback_kwargs}")
+                        
+                        # Clear cache and try again
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            **fallback_kwargs
+                        )
+                        debug_checkpoint("Fallback generation completed")
+                    else:
+                        raise  # Re-raise if not a CUDA error
             
             debug_checkpoint("Generation completed", "GENERATION_END")
             debug_memory_status()
@@ -704,6 +816,12 @@ class EightBitMarkdownInference:
             debug_checkpoint(f"Markdown generation failed with error: {str(e)}", "MD_FAILED")
             logger.error(f"Error during markdown generation: {e}")
             logger.error(f"Full traceback: {tb_module.format_exc()}")
+            
+            # Clear CUDA cache on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             raise
     
     def save_markdown(self, markdown_text, output_path):
@@ -791,7 +909,7 @@ Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
         return results
 
 def get_args():
-    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 with Enhanced Debugging - FINAL DEVICE FIX')
+    parser = argparse.ArgumentParser(description='8-bit Mixed Precision Markdown generation using Kosmos-2.5 with Enhanced Debugging - CUDA ERROR FIX')
     parser.add_argument('--image', '-i', type=str, required=True,
                        help='Path to input image file or URL')
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
@@ -802,12 +920,12 @@ def get_args():
                        help='Device to use (auto-detected if not specified)')
     
     # Enhanced token size configuration
-    parser.add_argument('--max_tokens', '--tokens', type=int, default=2048,
-                       help='Maximum number of tokens to generate (default: 2048, recommended: 1024-4096)')
+    parser.add_argument('--max_tokens', '--tokens', type=int, default=1024,  # Reduced default for stability
+                       help='Maximum number of tokens to generate (default: 1024, recommended: 512-2048)')
     parser.add_argument('--min_tokens', type=int, default=50,
                        help='Minimum number of tokens to generate (default: 50)')
     
-    parser.add_argument('--temperature', '-t', type=float, default=0.1,
+    parser.add_argument('--temperature', '-t', type=float, default=0.0,  # Default to deterministic
                        help='Sampling temperature (0 for deterministic, 0.1-1.0 for creative)')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
@@ -838,8 +956,8 @@ def main():
         logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
         sys.exit(1)
     
-    if args.max_tokens > 8192:
-        logger.warning(f"Very large max_tokens ({args.max_tokens}) may cause memory issues or long processing times.")
+    if args.max_tokens > 4096:  # More conservative limit
+        logger.warning(f"Large max_tokens ({args.max_tokens}) may cause CUDA errors. Consider using smaller values.")
     
     if args.temperature < 0 or args.temperature > 1.0:
         logger.error(f"Temperature must be between 0.0 and 1.0, got {args.temperature}")
