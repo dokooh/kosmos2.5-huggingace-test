@@ -42,260 +42,252 @@ class Kosmos25QuantizationTester:
                 return gpus[0].memoryUsed
         return psutil.virtual_memory().used / 1024  # MB
     
+    def run_kosmos_inference(self, model, processor, image, prompt="<ocr>"):
+        """Run inference using the correct Kosmos-2.5 API"""
+        inputs = processor(text=prompt, images=image, return_tensors="pt")
+        
+        # Move inputs to device
+        if self.device == "cuda":
+            inputs = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+        
+        # Generate using the model's forward method
+        generated_ids = model.generate(
+            pixel_values=inputs["pixel_values"],
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            image_embeds=None,
+            image_embeds_position_mask=inputs["image_embeds_position_mask"],
+            use_cache=True,
+            max_new_tokens=128,
+        )
+        
+        # Decode the generated text
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        # Process the output text
+        processed_text, _ = processor.post_process_generation(generated_text, cleanup_and_extract=False)
+        
+        return processed_text
+    
     def test_fp16_baseline(self):
         """Test baseline FP16 model"""
         print("\n=== Testing FP16 Baseline ===")
         
-        # Load model in FP16
-        model = AutoModel.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-        processor = AutoProcessor.from_pretrained(self.model_id)
-        
-        size_mb, param_count = self.measure_model_size(model)
-        memory_before = self.measure_memory()
-        
-        # Test inference
-        image = self.get_test_image()
-        prompt = "<ocr>"
-        
-        start_time = time.time()
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
+        try:
+            # Load model in FP16
+            model = AutoModel.from_pretrained(
+                self.model_id,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True
             )
-        
-        inference_time = time.time() - start_time
-        memory_after = self.measure_memory()
-        
-        result = processor.decode(outputs[0], skip_special_tokens=True)
-        
-        print(f"Model size: {size_mb:.2f} MB")
-        print(f"Parameters: {param_count:,}")
-        print(f"Memory usage: {memory_after - memory_before:.2f} MB")
-        print(f"Inference time: {inference_time:.2f}s")
-        print(f"Output preview: {result[:100]}...")
-        
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        
-        return {
-            "size_mb": size_mb,
-            "memory_mb": memory_after - memory_before,
-            "inference_time": inference_time
-        }
+            processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+            
+            size_mb, param_count = self.measure_model_size(model)
+            memory_before = self.measure_memory()
+            
+            # Test inference
+            image = self.get_test_image()
+            
+            start_time = time.time()
+            with torch.no_grad():
+                result = self.run_kosmos_inference(model, processor, image)
+            inference_time = time.time() - start_time
+            
+            memory_after = self.measure_memory()
+            
+            print(f"Model size: {size_mb:.2f} MB")
+            print(f"Parameters: {param_count:,}")
+            print(f"Memory usage: {memory_after - memory_before:.2f} MB")
+            print(f"Inference time: {inference_time:.2f}s")
+            print(f"Output preview: {result[:200]}...")
+            
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+            
+            return {
+                "size_mb": size_mb,
+                "memory_mb": memory_after - memory_before,
+                "inference_time": inference_time,
+                "output": result
+            }
+        except Exception as e:
+            print(f"Error in FP16 test: {e}")
+            return None
     
     def test_fp4_bitsandbytes(self):
         """Test FP4 quantization using BitsAndBytes"""
         print("\n=== Testing FP4 with BitsAndBytes ===")
         
-        # Configure 4-bit quantization
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="fp4"  # Use FP4 instead of NF4
-        )
-        
-        # Load model with 4-bit quantization
-        model = AutoModel.from_pretrained(
-            self.model_id,
-            quantization_config=quantization_config,
-            device_map="auto"
-        )
-        processor = AutoProcessor.from_pretrained(self.model_id)
-        
-        size_mb, param_count = self.measure_model_size(model)
-        memory_before = self.measure_memory()
-        
-        # Test inference
-        image = self.get_test_image()
-        prompt = "<ocr>"
-        
-        start_time = time.time()
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
+        try:
+            # Configure 4-bit quantization
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="fp4"  # Use FP4 instead of NF4
             )
-        
-        inference_time = time.time() - start_time
-        memory_after = self.measure_memory()
-        
-        result = processor.decode(outputs[0], skip_special_tokens=True)
-        
-        print(f"Model size: {size_mb:.2f} MB")
-        print(f"Parameters: {param_count:,}")
-        print(f"Memory usage: {memory_after - memory_before:.2f} MB")
-        print(f"Inference time: {inference_time:.2f}s")
-        print(f"Output preview: {result[:100]}...")
-        
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        
-        return {
-            "size_mb": size_mb,
-            "memory_mb": memory_after - memory_before,
-            "inference_time": inference_time
-        }
+            
+            # Load model with 4-bit quantization
+            model = AutoModel.from_pretrained(
+                self.model_id,
+                quantization_config=quantization_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+            
+            size_mb, param_count = self.measure_model_size(model)
+            memory_before = self.measure_memory()
+            
+            # Test inference
+            image = self.get_test_image()
+            
+            start_time = time.time()
+            with torch.no_grad():
+                result = self.run_kosmos_inference(model, processor, image)
+            inference_time = time.time() - start_time
+            
+            memory_after = self.measure_memory()
+            
+            print(f"Model size: {size_mb:.2f} MB")
+            print(f"Parameters: {param_count:,}")
+            print(f"Memory usage: {memory_after - memory_before:.2f} MB")
+            print(f"Inference time: {inference_time:.2f}s")
+            print(f"Output preview: {result[:200]}...")
+            
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+            
+            return {
+                "size_mb": size_mb,
+                "memory_mb": memory_after - memory_before,
+                "inference_time": inference_time,
+                "output": result
+            }
+        except Exception as e:
+            print(f"Error in FP4 test: {e}")
+            return None
     
     def test_nf4_bitsandbytes(self):
         """Test NF4 quantization using BitsAndBytes"""
         print("\n=== Testing NF4 with BitsAndBytes ===")
         
-        # Configure 4-bit quantization with NF4
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"  # Normal Float 4
-        )
-        
-        # Load model with 4-bit quantization
-        model = AutoModel.from_pretrained(
-            self.model_id,
-            quantization_config=quantization_config,
-            device_map="auto"
-        )
-        processor = AutoProcessor.from_pretrained(self.model_id)
-        
-        size_mb, param_count = self.measure_model_size(model)
-        memory_before = self.measure_memory()
-        
-        # Test inference
-        image = self.get_test_image()
-        prompt = "<ocr>"
-        
-        start_time = time.time()
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
+        try:
+            # Configure 4-bit quantization with NF4
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"  # Normal Float 4
             )
-        
-        inference_time = time.time() - start_time
-        memory_after = self.measure_memory()
-        
-        result = processor.decode(outputs[0], skip_special_tokens=True)
-        
-        print(f"Model size: {size_mb:.2f} MB")
-        print(f"Parameters: {param_count:,}")
-        print(f"Memory usage: {memory_after - memory_before:.2f} MB")
-        print(f"Inference time: {inference_time:.2f}s")
-        print(f"Output preview: {result[:100]}...")
-        
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        
-        return {
-            "size_mb": size_mb,
-            "memory_mb": memory_after - memory_before,
-            "inference_time": inference_time
-        }
+            
+            # Load model with 4-bit quantization
+            model = AutoModel.from_pretrained(
+                self.model_id,
+                quantization_config=quantization_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+            
+            size_mb, param_count = self.measure_model_size(model)
+            memory_before = self.measure_memory()
+            
+            # Test inference
+            image = self.get_test_image()
+            
+            start_time = time.time()
+            with torch.no_grad():
+                result = self.run_kosmos_inference(model, processor, image)
+            inference_time = time.time() - start_time
+            
+            memory_after = self.measure_memory()
+            
+            print(f"Model size: {size_mb:.2f} MB")
+            print(f"Parameters: {param_count:,}")
+            print(f"Memory usage: {memory_after - memory_before:.2f} MB")
+            print(f"Inference time: {inference_time:.2f}s")
+            print(f"Output preview: {result[:200]}...")
+            
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+            
+            return {
+                "size_mb": size_mb,
+                "memory_mb": memory_after - memory_before,
+                "inference_time": inference_time,
+                "output": result
+            }
+        except Exception as e:
+            print(f"Error in NF4 test: {e}")
+            return None
     
-    def test_dynamic_quantization(self):
-        """Test PyTorch dynamic quantization"""
-        print("\n=== Testing Dynamic Quantization ===")
+    def test_int8_quantization(self):
+        """Test INT8 quantization"""
+        print("\n=== Testing INT8 Quantization ===")
         
-        # Load model normally
-        model = AutoModel.from_pretrained(
-            self.model_id,
-            torch_dtype=torch.float32,
-        )
-        processor = AutoProcessor.from_pretrained(self.model_id)
-        
-        # Apply dynamic quantization
-        model = torch.quantization.quantize_dynamic(
-            model,
-            {torch.nn.Linear},
-            dtype=torch.qint8
-        )
-        
-        if self.device == "cuda":
-            model = model.to(self.device)
-        
-        size_mb, param_count = self.measure_model_size(model)
-        memory_before = self.measure_memory()
-        
-        # Test inference
-        image = self.get_test_image()
-        prompt = "<ocr>"
-        
-        start_time = time.time()
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=128,
+        try:
+            # Load model with INT8 quantization
+            model = AutoModel.from_pretrained(
+                self.model_id,
+                load_in_8bit=True,
+                device_map="auto",
+                trust_remote_code=True
             )
-        
-        inference_time = time.time() - start_time
-        memory_after = self.measure_memory()
-        
-        result = processor.decode(outputs[0], skip_special_tokens=True)
-        
-        print(f"Model size: {size_mb:.2f} MB")
-        print(f"Parameters: {param_count:,}")
-        print(f"Memory usage: {memory_after - memory_before:.2f} MB")
-        print(f"Inference time: {inference_time:.2f}s")
-        print(f"Output preview: {result[:100]}...")
-        
-        # Cleanup
-        del model
-        torch.cuda.empty_cache()
-        
-        return {
-            "size_mb": size_mb,
-            "memory_mb": memory_after - memory_before,
-            "inference_time": inference_time
-        }
+            processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+            
+            size_mb, param_count = self.measure_model_size(model)
+            memory_before = self.measure_memory()
+            
+            # Test inference
+            image = self.get_test_image()
+            
+            start_time = time.time()
+            with torch.no_grad():
+                result = self.run_kosmos_inference(model, processor, image)
+            inference_time = time.time() - start_time
+            
+            memory_after = self.measure_memory()
+            
+            print(f"Model size: {size_mb:.2f} MB")
+            print(f"Parameters: {param_count:,}")
+            print(f"Memory usage: {memory_after - memory_before:.2f} MB")
+            print(f"Inference time: {inference_time:.2f}s")
+            print(f"Output preview: {result[:200]}...")
+            
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+            
+            return {
+                "size_mb": size_mb,
+                "memory_mb": memory_after - memory_before,
+                "inference_time": inference_time,
+                "output": result
+            }
+        except Exception as e:
+            print(f"Error in INT8 test: {e}")
+            return None
     
     def run_all_tests(self):
         """Run all quantization tests and compare results"""
         results = {}
         
-        try:
-            # Test baseline FP16
-            results["fp16"] = self.test_fp16_baseline()
-        except Exception as e:
-            print(f"FP16 test failed: {e}")
-            results["fp16"] = None
+        # Test baseline FP16
+        results["fp16"] = self.test_fp16_baseline()
         
-        try:
-            # Test FP4 quantization
-            results["fp4"] = self.test_fp4_bitsandbytes()
-        except Exception as e:
-            print(f"FP4 test failed: {e}")
-            results["fp4"] = None
+        # Test INT8 quantization
+        results["int8"] = self.test_int8_quantization()
         
-        try:
-            # Test NF4 quantization
-            results["nf4"] = self.test_nf4_bitsandbytes()
-        except Exception as e:
-            print(f"NF4 test failed: {e}")
-            results["nf4"] = None
+        # Test FP4 quantization
+        results["fp4"] = self.test_fp4_bitsandbytes()
         
-        try:
-            # Test dynamic quantization
-            results["dynamic"] = self.test_dynamic_quantization()
-        except Exception as e:
-            print(f"Dynamic quantization test failed: {e}")
-            results["dynamic"] = None
+        # Test NF4 quantization
+        results["nf4"] = self.test_nf4_bitsandbytes()
         
         # Print comparison
         print("\n=== COMPARISON SUMMARY ===")
@@ -312,6 +304,8 @@ class Kosmos25QuantizationTester:
             speedup = results["fp16"]["inference_time"] / results["fp4"]["inference_time"]
             print(f"\nFP4 Compression ratio: {compression_ratio:.2f}x")
             print(f"FP4 Speedup: {speedup:.2f}x")
+        
+        return results
 
 if __name__ == "__main__":
     # Install required packages
