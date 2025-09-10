@@ -13,40 +13,83 @@ quantization_config = BitsAndBytesConfig(
 )
 
 # Load Kosmos-2.5 with FP4 quantization
+print("Loading Kosmos-2.5 with FP4 quantization...")
 model = AutoModel.from_pretrained(
     "microsoft/kosmos-2.5",
     quantization_config=quantization_config,
-    device_map="auto"
+    device_map="auto",
+    trust_remote_code=True
 )
-processor = AutoProcessor.from_pretrained("microsoft/kosmos-2.5")
+processor = AutoProcessor.from_pretrained("microsoft/kosmos-2.5", trust_remote_code=True)
 
 # Download test image
+print("Downloading test image...")
 image_url = "https://huggingface.co/microsoft/kosmos-2.5/resolve/main/receipt_00008.png"
 response = requests.get(image_url)
 image = Image.open(BytesIO(response.content))
 
-# Prepare input
-prompt = "<ocr>"  # OCR task
+# Test OCR task
+print("\n=== Testing OCR Task ===")
+prompt = "<ocr>"
 inputs = processor(text=prompt, images=image, return_tensors="pt")
 
 # Generate output
 with torch.no_grad():
-    outputs = model.generate(
-        **inputs,
+    generated_ids = model.generate(
+        pixel_values=inputs["pixel_values"],
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        image_embeds=None,
+        image_embeds_position_mask=inputs["image_embeds_position_mask"],
+        use_cache=True,
         max_new_tokens=256,
-        do_sample=False,
-        num_beams=1,
     )
 
-# Decode result
-result = processor.decode(outputs[0], skip_special_tokens=True)
+# Decode and process the output
+generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+processed_text, _ = processor.post_process_generation(generated_text, cleanup_and_extract=False)
 print("OCR Result:")
-print(result)
+print(processed_text)
 
-# For grounding tasks, you can use:
-# prompt = "<grounding>An image of"
-# This will generate bounding boxes for objects
+# Test grounding task
+print("\n=== Testing Grounding Task ===")
+prompt = "<grounding>An image of"
+inputs = processor(text=prompt, images=image, return_tensors="pt")
 
-# For MD-OCR tasks:
-# prompt = "<md>"
-# This will generate markdown-formatted OCR output
+with torch.no_grad():
+    generated_ids = model.generate(
+        pixel_values=inputs["pixel_values"],
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        image_embeds=None,
+        image_embeds_position_mask=inputs["image_embeds_position_mask"],
+        use_cache=True,
+        max_new_tokens=256,
+    )
+
+generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+processed_text, entities = processor.post_process_generation(generated_text, cleanup_and_extract=True)
+print("Grounding Result:")
+print(f"Text: {processed_text}")
+print(f"Entities: {entities}")
+
+# Test Markdown OCR
+print("\n=== Testing Markdown OCR Task ===")
+prompt = "<md>"
+inputs = processor(text=prompt, images=image, return_tensors="pt")
+
+with torch.no_grad():
+    generated_ids = model.generate(
+        pixel_values=inputs["pixel_values"],
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        image_embeds=None,
+        image_embeds_position_mask=inputs["image_embeds_position_mask"],
+        use_cache=True,
+        max_new_tokens=256,
+    )
+
+generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+processed_text, _ = processor.post_process_generation(generated_text, cleanup_and_extract=False)
+print("Markdown OCR Result:")
+print(processed_text)
