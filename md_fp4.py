@@ -1,5 +1,5 @@
 """
-Markdown inference script using saved FP4 quantized Kosmos-2.5 model
+Enhanced Markdown generation with proper text generation for Kosmos-2.5
 """
 
 import torch
@@ -11,9 +11,9 @@ from transformers import AutoModel, AutoProcessor
 from PIL import Image
 import requests
 from io import BytesIO
-from pathlib import Path
+import re
 
-class Kosmos25MarkdownInference:
+class EnhancedKosmos25Markdown:
     def __init__(self, model_path="./fp4_quantized_model"):
         self.model_path = model_path
         self.model = None
@@ -27,45 +27,215 @@ class Kosmos25MarkdownInference:
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Model directory not found: {self.model_path}")
         
-        # Check for metadata
-        metadata_path = os.path.join(self.model_path, "quantization_metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            print(f"Model info:")
-            print(f"  Quantization: {metadata.get('quantization_type', 'unknown')}")
-            print(f"  Size: {metadata.get('size_mb', 0):.1f} MB")
-            print(f"  Parameters: {metadata.get('parameter_count', 0):,}")
+        # Load model and processor
+        self.model = AutoModel.from_pretrained(
+            self.model_path,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True
+        )
+        
+        model_dtype = next(self.model.parameters()).dtype
+        print(f"✓ Model loaded successfully")
+        print(f"  Model dtype: {model_dtype}")
+        print(f"  Device: {next(self.model.parameters()).device}")
+    
+    def prepare_inputs(self, image, prompt="<md>"):
+        """Prepare inputs with proper dtype handling"""
+        model_dtype = next(self.model.parameters()).dtype
+        model_device = next(self.model.parameters()).device
+        
+        # Process inputs
+        inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        
+        # Convert to compatible dtype and device
+        processed_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.dtype.is_floating_point:
+                    processed_inputs[key] = value.to(dtype=model_dtype, device=model_device)
+                else:
+                    processed_inputs[key] = value.to(device=model_device)
+            else:
+                processed_inputs[key] = value
+        
+        return processed_inputs
+    
+    def generate_markdown(self, image, max_new_tokens=1024):
+        """Generate markdown using the model's generation capabilities"""
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        print("Generating markdown...")
         
         try:
-            start_time = time.time()
+            # Try different markdown prompts
+            prompts = ["<md>", "<ocr>"]  # Sometimes OCR works better for structured content
             
-            # Load model and processor
-            self.model = AutoModel.from_pretrained(
-                self.model_path,
-                device_map="auto",
-                trust_remote_code=True
-            )
+            for prompt in prompts:
+                print(f"Trying prompt: {prompt}")
+                
+                # Prepare inputs
+                inputs = self.prepare_inputs(image, prompt)
+                
+                # Get input_ids for generation
+                input_ids = inputs.get("input_ids")
+                if input_ids is None:
+                    continue
+                
+                # Generation parameters optimized for markdown
+                generation_kwargs = {
+                    "input_ids": input_ids,
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": True,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "num_beams": 1,
+                    "pad_token_id": self.processor.tokenizer.eos_token_id,
+                    "eos_token_id": self.processor.tokenizer.eos_token_id,
+                    "use_cache": True,
+                }
+                
+                # Add other inputs
+                for key, value in inputs.items():
+                    if key not in generation_kwargs and key != "input_ids":
+                        generation_kwargs[key] = value
+                
+                start_time = time.time()
+                
+                # Generate text
+                with torch.no_grad():
+                    generated_ids = self.model.generate(**generation_kwargs)
+                
+                generation_time = time.time() - start_time
+                
+                # Decode the generated text
+                input_length = input_ids.shape[1]
+                generated_text_ids = generated_ids[:, input_length:]
+                
+                generated_text = self.processor.tokenizer.decode(
+                    generated_text_ids[0], 
+                    skip_special_tokens=True
+                ).strip()
+                
+                print(f"Generated text length: {len(generated_text)}")
+                
+                if generated_text:
+                    print(f"✓ Success with prompt: {prompt}")
+                    return {
+                        "success": True,
+                        "generated_text": generated_text,
+                        "generation_time": generation_time,
+                        "prompt_used": prompt,
+                        "output_length": generated_text_ids.shape[1]
+                    }
+                else:
+                    print(f"Empty result with prompt: {prompt}")
             
-            self.processor = AutoProcessor.from_pretrained(
-                self.model_path,
-                trust_remote_code=True
-            )
-            
-            load_time = time.time() - start_time
-            model_dtype = next(self.model.parameters()).dtype
-            
-            print(f"✓ Model loaded in {load_time:.2f}s")
-            print(f"  Model dtype: {model_dtype}")
-            print(f"  Device: {next(self.model.parameters()).device}")
+            # If all prompts failed
+            return {
+                "success": False,
+                "error": "No markdown could be generated with any prompt",
+                "generated_text": "",
+                "generation_time": 0
+            }
             
         except Exception as e:
-            raise RuntimeError(f"Failed to load model: {e}")
+            print(f"✗ Markdown generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "generated_text": "",
+                "generation_time": 0
+            }
+    
+    def post_process_markdown(self, raw_text):
+        """Post-process generated text to improve markdown formatting"""
+        if not raw_text:
+            return ""
+        
+        # Remove special tokens
+        cleaned_text = raw_text.replace("<md>", "").replace("</md>", "")
+        cleaned_text = raw_text.replace("<ocr>", "").replace("</ocr>", "")
+        cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
+        
+        # Split into lines and process
+        lines = cleaned_text.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Apply markdown formatting heuristics
+            if self.is_title(line):
+                processed_lines.append(f"# {line}")
+            elif self.is_header(line):
+                processed_lines.append(f"## {line}")
+            elif self.is_bullet_point(line):
+                processed_lines.append(f"- {self.clean_bullet_point(line)}")
+            elif self.is_numbered_item(line):
+                processed_lines.append(line)  # Keep as-is
+            else:
+                processed_lines.append(line)
+            
+            # Add spacing after headers
+            if line.startswith('#'):
+                processed_lines.append("")
+        
+        # Join and clean up
+        result = '\n'.join(processed_lines)
+        
+        # Clean up excessive whitespace
+        result = re.sub(r'\n{3,}', '\n\n', result)
+        
+        return result.strip()
+    
+    def is_title(self, line):
+        """Check if line should be formatted as title"""
+        return (
+            len(line) < 50 and
+            (line.isupper() or 
+             any(word in line.lower() for word in ['invoice', 'receipt', 'document', 'report', 'title']) or
+             ':' not in line)
+        )
+    
+    def is_header(self, line):
+        """Check if line should be formatted as header"""
+        return (
+            len(line) < 30 and
+            (line.endswith(':') or 
+             any(word in line.lower() for word in ['section', 'details', 'information', 'summary']))
+        )
+    
+    def is_bullet_point(self, line):
+        """Check if line should be formatted as bullet point"""
+        return (
+            line.startswith(('•', '-', '*')) or
+            re.match(r'^[•\-\*]\s', line) or
+            (len(line) < 100 and any(word in line.lower() for word in ['product', 'item', 'service']))
+        )
+    
+    def is_numbered_item(self, line):
+        """Check if line is already a numbered item"""
+        return re.match(r'^\d+\.', line)
+    
+    def clean_bullet_point(self, line):
+        """Clean bullet point text"""
+        # Remove existing bullet characters
+        cleaned = re.sub(r'^[•\-\*]\s*', '', line)
+        return cleaned.strip()
     
     def load_image(self, image_input):
         """Load image from various sources"""
         if image_input.startswith(('http://', 'https://')):
-            # Load from URL
             print(f"Loading image from URL: {image_input}")
             try:
                 response = requests.get(image_input)
@@ -76,7 +246,6 @@ class Kosmos25MarkdownInference:
                 raise RuntimeError(f"Failed to load image from URL: {e}")
         
         elif os.path.exists(image_input):
-            # Load from local file
             print(f"Loading image from file: {image_input}")
             try:
                 image = Image.open(image_input)
@@ -85,324 +254,135 @@ class Kosmos25MarkdownInference:
                 raise RuntimeError(f"Failed to load image from file: {e}")
         
         elif image_input == "default":
-            # Create default test image with some structure
-            print("Using default test image (document-like)")
+            print("Creating default structured document...")
             from PIL import ImageDraw, ImageFont
             
-            image = Image.new('RGB', (800, 600), color=(255, 255, 255))
+            # Create a structured document for markdown testing
+            image = Image.new('RGB', (700, 500), color=(255, 255, 255))
             draw = ImageDraw.Draw(image)
             
-            # Try to use a basic font, fallback to default if not available
             try:
-                font = ImageFont.truetype("arial.ttf", 24)
-                small_font = ImageFont.truetype("arial.ttf", 16)
+                font_title = ImageFont.truetype("arial.ttf", 28)
+                font_header = ImageFont.truetype("arial.ttf", 20)
+                font_text = ImageFont.truetype("arial.ttf", 16)
             except:
-                font = ImageFont.load_default()
-                small_font = ImageFont.load_default()
+                font_title = ImageFont.load_default()
+                font_header = ImageFont.load_default()
+                font_text = ImageFont.load_default()
             
-            # Draw sample document content
-            draw.text((50, 50), "Document Title", fill=(0, 0, 0), font=font)
-            draw.text((50, 100), "This is a sample document with multiple paragraphs.", fill=(0, 0, 0), font=small_font)
-            draw.text((50, 130), "It contains structured text that can be converted to markdown.", fill=(0, 0, 0), font=small_font)
-            draw.text((50, 180), "• Bullet point 1", fill=(0, 0, 0), font=small_font)
-            draw.text((50, 210), "• Bullet point 2", fill=(0, 0, 0), font=small_font)
-            draw.text((50, 260), "Section Header", fill=(0, 0, 0), font=font)
-            draw.text((50, 310), "More content here with different formatting.", fill=(0, 0, 0), font=small_font)
+            # Draw structured content
+            y = 30
+            draw.text((50, y), "QUARTERLY REPORT", fill=(0, 0, 0), font=font_title)
+            y += 50
+            
+            draw.text((50, y), "Executive Summary", fill=(0, 0, 0), font=font_header)
+            y += 35
+            draw.text((70, y), "This quarter showed significant growth across all metrics.", fill=(0, 0, 0), font=font_text)
+            y += 25
+            draw.text((70, y), "Key achievements include improved efficiency and customer satisfaction.", fill=(0, 0, 0), font=font_text)
+            y += 40
+            
+            draw.text((50, y), "Key Metrics", fill=(0, 0, 0), font=font_header)
+            y += 35
+            draw.text((70, y), "• Revenue: $2.5M (+15%)", fill=(0, 0, 0), font=font_text)
+            y += 25
+            draw.text((70, y), "• Customer Growth: 1,200 new customers", fill=(0, 0, 0), font=font_text)
+            y += 25
+            draw.text((70, y), "• Satisfaction Score: 4.8/5.0", fill=(0, 0, 0), font=font_text)
+            y += 40
+            
+            draw.text((50, y), "Next Steps", fill=(0, 0, 0), font=font_header)
+            y += 35
+            draw.text((70, y), "1. Expand marketing efforts", fill=(0, 0, 0), font=font_text)
+            y += 25
+            draw.text((70, y), "2. Improve product features", fill=(0, 0, 0), font=font_text)
+            y += 25
+            draw.text((70, y), "3. Hire additional staff", fill=(0, 0, 0), font=font_text)
             
             return image
         
         else:
             raise ValueError(f"Invalid image input: {image_input}")
-    
-    def run_markdown_generation(self, image, extract_markdown_only=True):
-        """Run markdown generation inference on the image"""
-        if self.model is None or self.processor is None:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
-        
-        try:
-            print("Running markdown generation inference...")
-            start_time = time.time()
-            
-            # Prepare inputs for markdown generation
-            model_dtype = next(self.model.parameters()).dtype
-            inputs = self.processor(text="<md>", images=image, return_tensors="pt")
-            
-            # Convert inputs to correct dtype and device
-            processed_inputs = {}
-            for key, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    if value.dtype.is_floating_point:
-                        processed_inputs[key] = value.to(dtype=model_dtype, device=self.device)
-                    else:
-                        processed_inputs[key] = value.to(device=self.device)
-                else:
-                    processed_inputs[key] = value
-            
-            # Run inference
-            with torch.no_grad():
-                outputs = self.model(**processed_inputs)
-            
-            inference_time = time.time() - start_time
-            print(f"✓ Markdown generation completed in {inference_time:.2f}s")
-            
-            # Process outputs
-            result = self.process_markdown_output(outputs, extract_markdown_only)
-            
-            return {
-                "success": True,
-                "inference_time": inference_time,
-                "result": result,
-                "output_type": str(type(outputs))
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "inference_time": 0,
-                "result": None
-            }
-    
-    def process_markdown_output(self, outputs, extract_markdown_only=True):
-        """Process the model output to extract markdown results"""
-        try:
-            # Analyze output structure
-            output_info = {
-                "type": str(type(outputs)),
-                "attributes": []
-            }
-            
-            # Get available attributes
-            for attr in dir(outputs):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(outputs, attr)
-                        if isinstance(value, torch.Tensor):
-                            output_info["attributes"].append({
-                                "name": attr,
-                                "shape": list(value.shape),
-                                "dtype": str(value.dtype)
-                            })
-                    except:
-                        pass
-            
-            if extract_markdown_only:
-                # Try to extract markdown from common attributes
-                markdown_candidates = []
-                
-                # Check for logits or similar attributes that might contain markdown
-                for attr_info in output_info["attributes"]:
-                    attr_name = attr_info["name"]
-                    if "logits" in attr_name.lower() or "output" in attr_name.lower():
-                        try:
-                            tensor = getattr(outputs, attr_name)
-                            if tensor.dim() >= 2:
-                                # Try to decode as markdown
-                                predicted_ids = torch.argmax(tensor, dim=-1)
-                                if predicted_ids.dim() > 1:
-                                    sample_ids = predicted_ids[0][:200]  # More tokens for markdown
-                                else:
-                                    sample_ids = predicted_ids[:200]
-                                
-                                try:
-                                    decoded = self.processor.tokenizer.decode(sample_ids, skip_special_tokens=True)
-                                    if decoded.strip():
-                                        # Post-process to make it more markdown-like
-                                        processed_markdown = self.post_process_markdown(decoded.strip())
-                                        markdown_candidates.append({
-                                            "source": attr_name,
-                                            "raw_output": decoded.strip(),
-                                            "processed_markdown": processed_markdown
-                                        })
-                                except:
-                                    pass
-                        except:
-                            pass
-                
-                if markdown_candidates:
-                    return {
-                        "generated_markdown": markdown_candidates[0]["processed_markdown"],
-                        "raw_output": markdown_candidates[0]["raw_output"],
-                        "all_candidates": markdown_candidates,
-                        "output_structure": output_info
-                    }
-                else:
-                    return {
-                        "generated_markdown": "No markdown could be generated",
-                        "raw_output": "",
-                        "all_candidates": [],
-                        "output_structure": output_info
-                    }
-            else:
-                return output_info
-                
-        except Exception as e:
-            return {"error": f"Failed to process output: {e}"}
-    
-    def post_process_markdown(self, raw_text):
-        """Post-process raw output to improve markdown formatting"""
-        try:
-            lines = raw_text.split('\n')
-            processed_lines = []
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    processed_lines.append("")
-                    continue
-                
-                # Simple heuristics to improve markdown formatting
-                if line.isupper() and len(line) < 50:
-                    # Likely a header
-                    processed_lines.append(f"# {line.title()}")
-                elif line.startswith('-') or line.startswith('•'):
-                    # Bullet point
-                    processed_lines.append(f"- {line[1:].strip()}")
-                elif line.endswith(':') and len(line) < 30:
-                    # Likely a section header
-                    processed_lines.append(f"## {line[:-1]}")
-                else:
-                    # Regular text
-                    processed_lines.append(line)
-            
-            return '\n'.join(processed_lines)
-            
-        except Exception as e:
-            return raw_text  # Return original if processing fails
-    
-    def batch_markdown_generation(self, image_paths, output_dir=None):
-        """Run markdown generation on multiple images"""
-        results = []
-        
-        print(f"Processing {len(image_paths)} images...")
-        
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        
-        for i, image_path in enumerate(image_paths):
-            print(f"\nProcessing image {i+1}/{len(image_paths)}: {image_path}")
-            
-            try:
-                image = self.load_image(image_path)
-                result = self.run_markdown_generation(image)
-                result["image_path"] = image_path
-                results.append(result)
-                
-                if result["success"]:
-                    print(f"✓ Markdown generation successful")
-                    
-                    # Save individual markdown file if output directory specified
-                    if output_dir and "generated_markdown" in result["result"]:
-                        image_name = Path(image_path).stem if image_path != "default" else f"image_{i+1}"
-                        markdown_file = os.path.join(output_dir, f"{image_name}.md")
-                        
-                        with open(markdown_file, 'w', encoding='utf-8') as f:
-                            f.write(result["result"]["generated_markdown"])
-                        print(f"  Markdown saved to: {markdown_file}")
-                        result["markdown_file"] = markdown_file
-                else:
-                    print(f"✗ Markdown generation failed: {result['error']}")
-                    
-            except Exception as e:
-                print(f"✗ Failed to process {image_path}: {e}")
-                results.append({
-                    "image_path": image_path,
-                    "success": False,
-                    "error": str(e),
-                    "result": None
-                })
-        
-        return results
 
 def main():
-    parser = argparse.ArgumentParser(description="Markdown generation using FP4 quantized Kosmos-2.5")
+    parser = argparse.ArgumentParser(description="Enhanced markdown generation using FP4 quantized Kosmos-2.5")
     parser.add_argument("--model_path", type=str, default="./fp4_quantized_model",
                        help="Path to saved FP4 quantized model")
     parser.add_argument("--image", type=str, default="default",
                        help="Image path, URL, or 'default' for test image")
-    parser.add_argument("--batch", type=str, nargs='+',
-                       help="Multiple image paths for batch processing")
     parser.add_argument("--output", type=str,
-                       help="Output file to save results (JSON format)")
-    parser.add_argument("--output_dir", type=str,
-                       help="Output directory to save individual markdown files")
-    parser.add_argument("--verbose", action="store_true",
-                       help="Show detailed output structure")
+                       help="Output markdown file")
+    parser.add_argument("--output_json", type=str,
+                       help="Output JSON file with full results")
+    parser.add_argument("--max_tokens", type=int, default=1024,
+                       help="Maximum tokens to generate")
     
     args = parser.parse_args()
     
-    # Initialize markdown inference
-    markdown_gen = Kosmos25MarkdownInference(model_path=args.model_path)
+    # Initialize markdown generator
+    markdown_gen = EnhancedKosmos25Markdown(model_path=args.model_path)
     
     try:
         # Load model
         markdown_gen.load_model()
         
-        if args.batch:
-            # Batch processing
-            results = markdown_gen.batch_markdown_generation(args.batch, args.output_dir)
+        # Load image
+        image = markdown_gen.load_image(args.image)
+        print(f"Image size: {image.size}")
+        
+        # Generate markdown
+        result = markdown_gen.generate_markdown(image, max_new_tokens=args.max_tokens)
+        
+        # Display results
+        print(f"\n{'='*60}")
+        print("ENHANCED MARKDOWN GENERATION RESULTS")
+        print('='*60)
+        
+        if result["success"]:
+            raw_text = result.get("generated_text", "")
+            processed_markdown = markdown_gen.post_process_markdown(raw_text)
             
-            # Print summary
-            successful = sum(1 for r in results if r["success"])
-            print(f"\n{'='*50}")
-            print("BATCH MARKDOWN GENERATION SUMMARY")
-            print('='*50)
-            print(f"Total images: {len(results)}")
-            print(f"Successful: {successful}")
-            print(f"Failed: {len(results) - successful}")
+            print(f"✓ Markdown generation successful")
+            print(f"  Generation time: {result.get('generation_time', 0):.2f}s")
+            print(f"  Prompt used: {result.get('prompt_used', 'Unknown')}")
+            print(f"  Output tokens: {result.get('output_length', 0)}")
             
-            # Save batch results
-            if args.output:
-                with open(args.output, 'w') as f:
-                    json.dump(results, f, indent=2, default=str)
-                print(f"Batch results saved to {args.output}")
-            
-        else:
-            # Single image processing
-            image = markdown_gen.load_image(args.image)
-            result = markdown_gen.run_markdown_generation(image, extract_markdown_only=not args.verbose)
-            
-            print(f"\n{'='*50}")
-            print("MARKDOWN GENERATION RESULTS")
-            print('='*50)
-            
-            if result["success"]:
-                print(f"✓ Markdown generation successful (inference time: {result['inference_time']:.2f}s)")
+            if processed_markdown:
+                print(f"\nGenerated Markdown:")
+                print("-" * 40)
+                print(processed_markdown)
                 
-                if "generated_markdown" in result["result"]:
-                    print(f"\nGenerated Markdown:")
-                    print("-" * 30)
-                    print(result["result"]["generated_markdown"])
-                    
-                    if args.verbose and "raw_output" in result["result"]:
-                        print(f"\nRaw Output:")
-                        print("-" * 30)
-                        print(result["result"]["raw_output"])
+                print(f"\nRaw Generated Text:")
+                print("-" * 40)
+                print(raw_text[:500] + "..." if len(raw_text) > 500 else raw_text)
                 
-                if args.verbose:
-                    print(f"\nOutput structure:")
-                    output_structure = result["result"].get("output_structure", {})
-                    print(f"  Type: {output_structure.get('type', 'Unknown')}")
-                    print(f"  Attributes: {len(output_structure.get('attributes', []))}")
-                    for attr in output_structure.get('attributes', []):
-                        print(f"    {attr['name']}: {attr['shape']} ({attr['dtype']})")
-                
-                # Save markdown to file
-                if args.output_dir:
-                    os.makedirs(args.output_dir, exist_ok=True)
-                    markdown_file = os.path.join(args.output_dir, "generated.md")
-                    with open(markdown_file, 'w', encoding='utf-8') as f:
-                        f.write(result["result"]["generated_markdown"])
-                    print(f"\nMarkdown saved to: {markdown_file}")
-                    
+                # Save markdown file
+                if args.output:
+                    with open(args.output, 'w', encoding='utf-8') as f:
+                        f.write(processed_markdown)
+                    print(f"\nMarkdown saved to: {args.output}")
             else:
-                print(f"✗ Markdown generation failed: {result['error']}")
+                print("\n⚠️  No markdown could be generated from the image")
+                print("Possible reasons:")
+                print("- The image may not contain structured text")
+                print("- Different generation parameters might be needed")
+                print("- The image preprocessing may need adjustment")
+        else:
+            print(f"✗ Markdown generation failed: {result.get('error', 'Unknown error')}")
+        
+        # Save JSON results
+        if args.output_json:
+            output_data = {
+                "image_source": args.image,
+                "model_path": args.model_path,
+                "result": result,
+                "processed_markdown": markdown_gen.post_process_markdown(result.get("generated_text", "")),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
             
-            # Save single result if output specified
-            if args.output:
-                with open(args.output, 'w') as f:
-                    json.dump(result, f, indent=2, default=str)
-                print(f"\nResult saved to {args.output}")
+            with open(args.output_json, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            print(f"\nDetailed results saved to: {args.output_json}")
         
     except Exception as e:
         print(f"✗ Error: {e}")
