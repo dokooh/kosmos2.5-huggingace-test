@@ -1,5 +1,5 @@
 """
-OCR inference script using saved FP4 quantized Kosmos-2.5 model
+Enhanced OCR inference with proper text generation for Kosmos-2.5
 """
 
 import torch
@@ -11,9 +11,9 @@ from transformers import AutoModel, AutoProcessor
 from PIL import Image
 import requests
 from io import BytesIO
-from pathlib import Path
+import re
 
-class Kosmos25OCRInference:
+class EnhancedKosmos25OCR:
     def __init__(self, model_path="./fp4_quantized_model"):
         self.model_path = model_path
         self.model = None
@@ -27,45 +27,188 @@ class Kosmos25OCRInference:
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Model directory not found: {self.model_path}")
         
-        # Check for metadata
-        metadata_path = os.path.join(self.model_path, "quantization_metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            print(f"Model info:")
-            print(f"  Quantization: {metadata.get('quantization_type', 'unknown')}")
-            print(f"  Size: {metadata.get('size_mb', 0):.1f} MB")
-            print(f"  Parameters: {metadata.get('parameter_count', 0):,}")
+        # Load model and processor
+        self.model = AutoModel.from_pretrained(
+            self.model_path,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True
+        )
+        
+        model_dtype = next(self.model.parameters()).dtype
+        print(f"✓ Model loaded successfully")
+        print(f"  Model dtype: {model_dtype}")
+        print(f"  Device: {next(self.model.parameters()).device}")
+    
+    def prepare_inputs(self, image, prompt="<ocr>"):
+        """Prepare inputs with proper dtype handling"""
+        model_dtype = next(self.model.parameters()).dtype
+        model_device = next(self.model.parameters()).device
+        
+        # Process inputs
+        inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        
+        # Convert to compatible dtype and device
+        processed_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                if value.dtype.is_floating_point:
+                    processed_inputs[key] = value.to(dtype=model_dtype, device=model_device)
+                else:
+                    processed_inputs[key] = value.to(device=model_device)
+            else:
+                processed_inputs[key] = value
+        
+        return processed_inputs
+    
+    def generate_text(self, image, prompt="<ocr>", max_new_tokens=512):
+        """Generate text using the model's generation capabilities"""
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        print(f"Generating text with prompt: {prompt}")
         
         try:
+            # Prepare inputs
+            inputs = self.prepare_inputs(image, prompt)
+            
+            # Get input_ids for generation
+            input_ids = inputs.get("input_ids")
+            if input_ids is None:
+                raise ValueError("No input_ids found in processed inputs")
+            
+            # Generation parameters
+            generation_kwargs = {
+                "input_ids": input_ids,
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,  # Use greedy decoding for consistency
+                "num_beams": 1,
+                "pad_token_id": self.processor.tokenizer.eos_token_id,
+                "eos_token_id": self.processor.tokenizer.eos_token_id,
+                "use_cache": True,
+            }
+            
+            # Add other inputs if available
+            for key, value in inputs.items():
+                if key not in generation_kwargs and key != "input_ids":
+                    generation_kwargs[key] = value
+            
+            print("Running text generation...")
             start_time = time.time()
             
-            # Load model and processor
-            self.model = AutoModel.from_pretrained(
-                self.model_path,
-                device_map="auto",
-                trust_remote_code=True
-            )
+            # Generate text
+            with torch.no_grad():
+                generated_ids = self.model.generate(**generation_kwargs)
             
-            self.processor = AutoProcessor.from_pretrained(
-                self.model_path,
-                trust_remote_code=True
-            )
+            generation_time = time.time() - start_time
+            print(f"✓ Text generation completed in {generation_time:.2f}s")
             
-            load_time = time.time() - start_time
-            model_dtype = next(self.model.parameters()).dtype
+            # Decode the generated text
+            # Remove the input prompt from generated text
+            input_length = input_ids.shape[1]
+            generated_text_ids = generated_ids[:, input_length:]
             
-            print(f"✓ Model loaded in {load_time:.2f}s")
-            print(f"  Model dtype: {model_dtype}")
-            print(f"  Device: {next(self.model.parameters()).device}")
+            # Decode
+            generated_text = self.processor.tokenizer.decode(
+                generated_text_ids[0], 
+                skip_special_tokens=True
+            ).strip()
+            
+            print(f"Raw generated text length: {len(generated_text)}")
+            
+            return {
+                "success": True,
+                "generated_text": generated_text,
+                "generation_time": generation_time,
+                "input_length": input_length,
+                "output_length": generated_text_ids.shape[1]
+            }
             
         except Exception as e:
-            raise RuntimeError(f"Failed to load model: {e}")
+            print(f"✗ Text generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "generated_text": "",
+                "generation_time": 0
+            }
+    
+    def post_process_ocr(self, raw_text):
+        """Post-process OCR text to clean it up"""
+        if not raw_text:
+            return ""
+        
+        # Remove special tokens and cleanup
+        cleaned_text = raw_text.replace("<ocr>", "").replace("</ocr>", "")
+        cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)  # Remove remaining XML tags
+        
+        # Clean up whitespace
+        lines = [line.strip() for line in cleaned_text.split('\n')]
+        lines = [line for line in lines if line]  # Remove empty lines
+        
+        # Join with proper spacing
+        result = '\n'.join(lines)
+        
+        return result.strip()
+    
+    def run_ocr(self, image):
+        """Run OCR with enhanced text generation"""
+        print("Running enhanced OCR...")
+        
+        # Try different generation approaches
+        approaches = [
+            {"prompt": "<ocr>", "max_tokens": 512, "description": "Standard OCR"},
+            {"prompt": "<ocr>", "max_tokens": 1024, "description": "Extended OCR"},
+        ]
+        
+        results = []
+        
+        for approach in approaches:
+            print(f"\nTrying: {approach['description']}")
+            
+            result = self.generate_text(
+                image, 
+                prompt=approach["prompt"],
+                max_new_tokens=approach["max_tokens"]
+            )
+            
+            if result["success"]:
+                # Post-process the text
+                processed_text = self.post_process_ocr(result["generated_text"])
+                result["processed_text"] = processed_text
+                result["approach"] = approach["description"]
+                
+                print(f"Generated text preview: {processed_text[:100]}...")
+                
+                if processed_text:
+                    print(f"✓ Found non-empty OCR result with {approach['description']}")
+                    results.append(result)
+                    break  # Use first successful result
+                else:
+                    print(f"⚠️  Empty result with {approach['description']}")
+            else:
+                print(f"✗ Failed with {approach['description']}: {result['error']}")
+        
+        # Return best result or empty result
+        if results:
+            return results[0]
+        else:
+            return {
+                "success": False,
+                "error": "No OCR text could be generated",
+                "processed_text": "",
+                "generated_text": ""
+            }
     
     def load_image(self, image_input):
         """Load image from various sources"""
         if image_input.startswith(('http://', 'https://')):
-            # Load from URL
             print(f"Loading image from URL: {image_input}")
             try:
                 response = requests.get(image_input)
@@ -76,7 +219,6 @@ class Kosmos25OCRInference:
                 raise RuntimeError(f"Failed to load image from URL: {e}")
         
         elif os.path.exists(image_input):
-            # Load from local file
             print(f"Loading image from file: {image_input}")
             try:
                 image = Image.open(image_input)
@@ -85,245 +227,117 @@ class Kosmos25OCRInference:
                 raise RuntimeError(f"Failed to load image from file: {e}")
         
         elif image_input == "default":
-            # Create default test image
-            print("Using default test image")
-            return Image.new('RGB', (300, 400), color=(255, 255, 255))
+            print("Creating default test image with text...")
+            from PIL import ImageDraw, ImageFont
+            
+            # Create a more realistic test image
+            image = Image.new('RGB', (600, 400), color=(255, 255, 255))
+            draw = ImageDraw.Draw(image)
+            
+            try:
+                font_large = ImageFont.truetype("arial.ttf", 24)
+                font_medium = ImageFont.truetype("arial.ttf", 18)
+                font_small = ImageFont.truetype("arial.ttf", 14)
+            except:
+                font_large = ImageFont.load_default()
+                font_medium = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+            
+            # Draw realistic document content
+            y = 30
+            draw.text((50, y), "Invoice #12345", fill=(0, 0, 0), font=font_large)
+            y += 40
+            draw.text((50, y), "Date: January 15, 2024", fill=(0, 0, 0), font=font_medium)
+            y += 30
+            draw.text((50, y), "Customer: John Smith", fill=(0, 0, 0), font=font_medium)
+            y += 30
+            draw.text((50, y), "Address: 123 Main Street, City, State 12345", fill=(0, 0, 0), font=font_small)
+            y += 40
+            draw.text((50, y), "Items:", fill=(0, 0, 0), font=font_medium)
+            y += 25
+            draw.text((70, y), "• Product A - $25.00", fill=(0, 0, 0), font=font_small)
+            y += 20
+            draw.text((70, y), "• Product B - $15.50", fill=(0, 0, 0), font=font_small)
+            y += 20
+            draw.text((70, y), "• Service Fee - $10.00", fill=(0, 0, 0), font=font_small)
+            y += 30
+            draw.text((50, y), "Total: $50.50", fill=(0, 0, 0), font=font_medium)
+            
+            return image
         
         else:
             raise ValueError(f"Invalid image input: {image_input}")
-    
-    def run_ocr(self, image, extract_text_only=True):
-        """Run OCR inference on the image"""
-        if self.model is None or self.processor is None:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
-        
-        try:
-            print("Running OCR inference...")
-            start_time = time.time()
-            
-            # Prepare inputs
-            model_dtype = next(self.model.parameters()).dtype
-            inputs = self.processor(text="<ocr>", images=image, return_tensors="pt")
-            
-            # Convert inputs to correct dtype and device
-            processed_inputs = {}
-            for key, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    if value.dtype.is_floating_point:
-                        processed_inputs[key] = value.to(dtype=model_dtype, device=self.device)
-                    else:
-                        processed_inputs[key] = value.to(device=self.device)
-                else:
-                    processed_inputs[key] = value
-            
-            # Run inference
-            with torch.no_grad():
-                outputs = self.model(**processed_inputs)
-            
-            inference_time = time.time() - start_time
-            print(f"✓ OCR completed in {inference_time:.2f}s")
-            
-            # Process outputs
-            result = self.process_ocr_output(outputs, extract_text_only)
-            
-            return {
-                "success": True,
-                "inference_time": inference_time,
-                "result": result,
-                "output_type": str(type(outputs))
-            }
-            
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "inference_time": 0,
-                "result": None
-            }
-    
-    def process_ocr_output(self, outputs, extract_text_only=True):
-        """Process the model output to extract OCR results"""
-        try:
-            # Analyze output structure
-            output_info = {
-                "type": str(type(outputs)),
-                "attributes": []
-            }
-            
-            # Get available attributes
-            for attr in dir(outputs):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(outputs, attr)
-                        if isinstance(value, torch.Tensor):
-                            output_info["attributes"].append({
-                                "name": attr,
-                                "shape": list(value.shape),
-                                "dtype": str(value.dtype)
-                            })
-                    except:
-                        pass
-            
-            if extract_text_only:
-                # Try to extract text from common attributes
-                text_candidates = []
-                
-                # Check for logits or similar attributes that might contain text
-                for attr_info in output_info["attributes"]:
-                    attr_name = attr_info["name"]
-                    if "logits" in attr_name.lower() or "output" in attr_name.lower():
-                        try:
-                            tensor = getattr(outputs, attr_name)
-                            if tensor.dim() >= 2:
-                                # Try to decode as text
-                                predicted_ids = torch.argmax(tensor, dim=-1)
-                                if predicted_ids.dim() > 1:
-                                    sample_ids = predicted_ids[0][:100]  # First 100 tokens
-                                else:
-                                    sample_ids = predicted_ids[:100]
-                                
-                                try:
-                                    decoded = self.processor.tokenizer.decode(sample_ids, skip_special_tokens=True)
-                                    if decoded.strip():
-                                        text_candidates.append({
-                                            "source": attr_name,
-                                            "text": decoded.strip()
-                                        })
-                                except:
-                                    pass
-                        except:
-                            pass
-                
-                if text_candidates:
-                    return {
-                        "extracted_text": text_candidates[0]["text"],
-                        "all_candidates": text_candidates,
-                        "output_structure": output_info
-                    }
-                else:
-                    return {
-                        "extracted_text": "No text could be extracted",
-                        "all_candidates": [],
-                        "output_structure": output_info
-                    }
-            else:
-                return output_info
-                
-        except Exception as e:
-            return {"error": f"Failed to process output: {e}"}
-    
-    def batch_ocr(self, image_paths, output_file=None):
-        """Run OCR on multiple images"""
-        results = []
-        
-        print(f"Processing {len(image_paths)} images...")
-        
-        for i, image_path in enumerate(image_paths):
-            print(f"\nProcessing image {i+1}/{len(image_paths)}: {image_path}")
-            
-            try:
-                image = self.load_image(image_path)
-                result = self.run_ocr(image)
-                result["image_path"] = image_path
-                results.append(result)
-                
-                if result["success"]:
-                    print(f"✓ OCR successful")
-                    if "extracted_text" in result["result"]:
-                        preview = result["result"]["extracted_text"][:100]
-                        print(f"  Text preview: {preview}...")
-                else:
-                    print(f"✗ OCR failed: {result['error']}")
-                    
-            except Exception as e:
-                print(f"✗ Failed to process {image_path}: {e}")
-                results.append({
-                    "image_path": image_path,
-                    "success": False,
-                    "error": str(e),
-                    "result": None
-                })
-        
-        # Save results if output file specified
-        if output_file:
-            print(f"\nSaving results to {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
-        
-        return results
 
 def main():
-    parser = argparse.ArgumentParser(description="OCR inference using FP4 quantized Kosmos-2.5")
+    parser = argparse.ArgumentParser(description="Enhanced OCR inference using FP4 quantized Kosmos-2.5")
     parser.add_argument("--model_path", type=str, default="./fp4_quantized_model",
                        help="Path to saved FP4 quantized model")
     parser.add_argument("--image", type=str, default="default",
                        help="Image path, URL, or 'default' for test image")
-    parser.add_argument("--batch", type=str, nargs='+',
-                       help="Multiple image paths for batch processing")
     parser.add_argument("--output", type=str,
-                       help="Output file to save results (JSON format)")
-    parser.add_argument("--verbose", action="store_true",
-                       help="Show detailed output structure")
+                       help="Output file to save OCR results")
+    parser.add_argument("--max_tokens", type=int, default=512,
+                       help="Maximum tokens to generate")
     
     args = parser.parse_args()
     
-    # Initialize OCR inference
-    ocr = Kosmos25OCRInference(model_path=args.model_path)
+    # Initialize OCR
+    ocr = EnhancedKosmos25OCR(model_path=args.model_path)
     
     try:
         # Load model
         ocr.load_model()
         
-        if args.batch:
-            # Batch processing
-            results = ocr.batch_ocr(args.batch, args.output)
+        # Load image
+        image = ocr.load_image(args.image)
+        print(f"Image size: {image.size}")
+        
+        # Run OCR
+        result = ocr.run_ocr(image)
+        
+        # Display results
+        print(f"\n{'='*60}")
+        print("ENHANCED OCR RESULTS")
+        print('='*60)
+        
+        if result["success"]:
+            processed_text = result.get("processed_text", "")
+            raw_text = result.get("generated_text", "")
             
-            # Print summary
-            successful = sum(1 for r in results if r["success"])
-            print(f"\n{'='*50}")
-            print("BATCH OCR SUMMARY")
-            print('='*50)
-            print(f"Total images: {len(results)}")
-            print(f"Successful: {successful}")
-            print(f"Failed: {len(results) - successful}")
+            print(f"✓ OCR successful")
+            print(f"  Generation time: {result.get('generation_time', 0):.2f}s")
+            print(f"  Output tokens: {result.get('output_length', 0)}")
+            print(f"  Approach: {result.get('approach', 'Unknown')}")
             
-        else:
-            # Single image processing
-            image = ocr.load_image(args.image)
-            result = ocr.run_ocr(image, extract_text_only=not args.verbose)
-            
-            print(f"\n{'='*50}")
-            print("OCR RESULTS")
-            print('='*50)
-            
-            if result["success"]:
-                print(f"✓ OCR successful (inference time: {result['inference_time']:.2f}s)")
+            if processed_text:
+                print(f"\nExtracted Text:")
+                print("-" * 40)
+                print(processed_text)
                 
-                if "extracted_text" in result["result"]:
-                    print(f"\nExtracted Text:")
-                    print("-" * 30)
-                    print(result["result"]["extracted_text"])
-                    
-                    if args.verbose and "all_candidates" in result["result"]:
-                        print(f"\nAll text candidates:")
-                        for candidate in result["result"]["all_candidates"]:
-                            print(f"  {candidate['source']}: {candidate['text'][:100]}...")
-                
-                if args.verbose:
-                    print(f"\nOutput structure:")
-                    output_structure = result["result"].get("output_structure", {})
-                    print(f"  Type: {output_structure.get('type', 'Unknown')}")
-                    print(f"  Attributes: {len(output_structure.get('attributes', []))}")
-                    for attr in output_structure.get('attributes', []):
-                        print(f"    {attr['name']}: {attr['shape']} ({attr['dtype']})")
+                print(f"\nRaw Generated Text:")
+                print("-" * 40)
+                print(raw_text[:500] + "..." if len(raw_text) > 500 else raw_text)
             else:
-                print(f"✗ OCR failed: {result['error']}")
+                print("\n⚠️  No text could be extracted from the image")
+                print("This might indicate:")
+                print("- The image contains no readable text")
+                print("- The model needs different generation parameters")
+                print("- The image preprocessing needs adjustment")
+        else:
+            print(f"✗ OCR failed: {result.get('error', 'Unknown error')}")
+        
+        # Save results
+        if args.output:
+            output_data = {
+                "image_source": args.image,
+                "model_path": args.model_path,
+                "result": result,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
             
-            # Save single result if output specified
-            if args.output:
-                with open(args.output, 'w') as f:
-                    json.dump(result, f, indent=2, default=str)
-                print(f"\nResult saved to {args.output}")
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            print(f"\nResults saved to: {args.output}")
         
     except Exception as e:
         print(f"✗ Error: {e}")
