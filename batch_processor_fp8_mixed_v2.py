@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 """
-Enhanced Batch Processor for Kosmos-2.5 8-bit Mixed Precision with Complete Device Management
+Enhanced Batch Processor for Kosmos-2.5 8-bit Mixed Precision with Resource Monitoring
 
-This module provides comprehensive batch processing capabilities for both OCR and Markdown generation
-using the optimized 8-bit mixed precision modules (ocr_fp8_mixed.py and md_fp8_mixed.py).
-
-Features:
-- 8-bit mixed precision quantization with automatic fallback
-- Complete device placement management
-- Enhanced debugging and error handling
-- Parallel and sequential processing modes
-- Comprehensive progress tracking and reporting
-- SafeTensors format support
-- Memory optimization with gradient checkpointing
-- Robust error recovery and fallback mechanisms
-- Resource usage monitoring (GPU memory, CPU, RAM)
+This module provides comprehensive batch processing capabilities with system resource tracking
+for GPU memory, CPU usage, and RAM usage across all batches.
 """
 
 import os
@@ -40,7 +29,7 @@ except ImportError as e:
     print("Make sure ocr_fp8_mixed.py and md_fp8_mixed.py are in the same directory")
     sys.exit(1)
 
-# Enhanced logging setup with more detailed formatting
+# Enhanced logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
@@ -51,113 +40,299 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class ResourceMonitor:
-    """Resource monitoring class to track GPU memory, CPU, and RAM usage"""
+class SystemResourceMonitor:
+    """Comprehensive system resource monitor for GPU memory, CPU, and RAM usage"""
     
-    def __init__(self):
-        self.gpu_memory_samples = []
-        self.cpu_usage_samples = []
-        self.ram_usage_samples = []
-        self._monitor_thread = None
-        self._monitoring = False
+    def __init__(self, enable_gpu_monitoring: bool = True):
+        self.enable_gpu_monitoring = enable_gpu_monitoring
+        self.monitoring_active = False
         self._lock = threading.Lock()
+        self._monitor_thread = None
+        self._stop_event = threading.Event()
         
-        # Check if torch is available for GPU monitoring
+        # Resource samples storage
+        self.cpu_samples = []
+        self.ram_samples = []
+        self.gpu_memory_samples = []
+        self.gpu_utilization_samples = []
+        
+        # Initialize GPU monitoring
+        self._initialize_gpu_monitoring()
+        
+    def _initialize_gpu_monitoring(self):
+        """Initialize GPU monitoring capabilities"""
         try:
             import torch
             self.torch_available = True
             self.cuda_available = torch.cuda.is_available()
+            
+            if self.cuda_available:
+                self.gpu_count = torch.cuda.device_count()
+                self.gpu_names = [torch.cuda.get_device_name(i) for i in range(self.gpu_count)]
+                self.gpu_total_memory = []
+                
+                for i in range(self.gpu_count):
+                    props = torch.cuda.get_device_properties(i)
+                    self.gpu_total_memory.append(props.total_memory / (1024**3))  # GB
+                
+                logger.info(f"GPU monitoring initialized - {self.gpu_count} GPU(s) detected")
+                for i, name in enumerate(self.gpu_names):
+                    logger.info(f"  GPU {i}: {name} ({self.gpu_total_memory[i]:.1f} GB)")
+            else:
+                logger.info("CUDA not available - GPU monitoring disabled")
+                self.gpu_count = 0
+                self.gpu_names = []
+                self.gpu_total_memory = []
+                
         except ImportError:
+            logger.warning("PyTorch not available - GPU monitoring disabled")
             self.torch_available = False
             self.cuda_available = False
+            self.gpu_count = 0
+            self.gpu_names = []
+            self.gpu_total_memory = []
     
-    def start_monitoring(self, interval: float = 1.0):
-        """Start resource monitoring in a separate thread"""
-        if self._monitoring:
+    def start_monitoring(self, sample_interval: float = 1.0):
+        """Start background resource monitoring"""
+        if self.monitoring_active:
             return
+            
+        self.reset_samples()
+        self.monitoring_active = True
+        self._stop_event.clear()
         
-        self._monitoring = True
-        self._monitor_thread = threading.Thread(target=self._monitor_resources, args=(interval,))
-        self._monitor_thread.daemon = True
+        def monitor_loop():
+            while not self._stop_event.is_set():
+                try:
+                    self._collect_sample()
+                    time.sleep(sample_interval)
+                except Exception as e:
+                    logger.debug(f"Error in monitoring loop: {e}")
+                    time.sleep(sample_interval)
+        
+        self._monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         self._monitor_thread.start()
-        logger.info(f"Started resource monitoring with {interval}s interval")
+        logger.info(f"Resource monitoring started (interval: {sample_interval}s)")
     
     def stop_monitoring(self):
-        """Stop resource monitoring"""
-        self._monitoring = False
-        if self._monitor_thread:
-            self._monitor_thread.join(timeout=2.0)
-        logger.info("Stopped resource monitoring")
+        """Stop background resource monitoring"""
+        if not self.monitoring_active:
+            return
+            
+        self.monitoring_active = False
+        self._stop_event.set()
+        
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=5.0)
+            
+        logger.info("Resource monitoring stopped")
     
-    def _monitor_resources(self, interval: float):
-        """Monitor resources in a loop"""
-        while self._monitoring:
+    def _collect_sample(self):
+        """Collect a single sample of system resources"""
+        with self._lock:
+            if not self.monitoring_active:
+                return
+            
+            # CPU usage
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            self.cpu_samples.append(cpu_percent)
+            
+            # RAM usage
+            memory_info = psutil.virtual_memory()
+            ram_percent = memory_info.percent
+            ram_used_gb = memory_info.used / (1024**3)
+            self.ram_samples.append({
+                'percent': ram_percent,
+                'used_gb': ram_used_gb,
+                'available_gb': memory_info.available / (1024**3)
+            })
+            
+            # GPU monitoring if available
+            if self.cuda_available and self.enable_gpu_monitoring:
+                try:
+                    import torch
+                    gpu_data = []
+                    
+                    for i in range(self.gpu_count):
+                        try:
+                            # Set device context
+                            torch.cuda.set_device(i)
+                            
+                            # Memory usage
+                            allocated = torch.cuda.memory_allocated(i) / (1024**3)  # GB
+                            cached = torch.cuda.memory_reserved(i) / (1024**3)      # GB
+                            total = self.gpu_total_memory[i]
+                            
+                            # Calculate percentages
+                            allocated_percent = (allocated / total) * 100 if total > 0 else 0
+                            cached_percent = (cached / total) * 100 if total > 0 else 0
+                            
+                            gpu_data.append({
+                                'device': i,
+                                'allocated_gb': allocated,
+                                'cached_gb': cached,
+                                'total_gb': total,
+                                'allocated_percent': allocated_percent,
+                                'cached_percent': cached_percent
+                            })
+                            
+                        except Exception as e:
+                            logger.debug(f"Failed to get GPU {i} stats: {e}")
+                            gpu_data.append({
+                                'device': i,
+                                'allocated_gb': 0,
+                                'cached_gb': 0,
+                                'total_gb': self.gpu_total_memory[i] if i < len(self.gpu_total_memory) else 0,
+                                'allocated_percent': 0,
+                                'cached_percent': 0,
+                                'error': str(e)
+                            })
+                    
+                    self.gpu_memory_samples.append(gpu_data)
+                    
+                except Exception as e:
+                    logger.debug(f"GPU monitoring error: {e}")
+    
+    def get_current_snapshot(self) -> Dict[str, Any]:
+        """Get current resource usage snapshot"""
+        snapshot = {
+            'timestamp': time.time(),
+            'cpu_percent': psutil.cpu_percent(interval=0.1),
+            'memory': psutil.virtual_memory()._asdict(),
+        }
+        
+        if self.cuda_available and self.enable_gpu_monitoring:
             try:
-                # Get CPU usage
-                cpu_percent = psutil.cpu_percent(interval=0.1)
-                
-                # Get RAM usage
-                memory_info = psutil.virtual_memory()
-                ram_percent = memory_info.percent
-                
-                # Get GPU memory usage if available
-                gpu_memory_mb = 0
-                gpu_memory_percent = 0
-                if self.torch_available and self.cuda_available:
-                    try:
-                        import torch
-                        gpu_memory_used = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
-                        gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)  # MB
-                        gpu_memory_mb = gpu_memory_used
-                        gpu_memory_percent = (gpu_memory_used / gpu_memory_total) * 100 if gpu_memory_total > 0 else 0
-                    except Exception as e:
-                        logger.debug(f"Failed to get GPU memory: {e}")
-                
-                # Store samples with lock
-                with self._lock:
-                    self.cpu_usage_samples.append(cpu_percent)
-                    self.ram_usage_samples.append(ram_percent)
-                    self.gpu_memory_samples.append({
-                        'memory_mb': gpu_memory_mb,
-                        'memory_percent': gpu_memory_percent
+                import torch
+                gpu_info = []
+                for i in range(self.gpu_count):
+                    allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    cached = torch.cuda.memory_reserved(i) / (1024**3)
+                    total = self.gpu_total_memory[i]
+                    
+                    gpu_info.append({
+                        'device': i,
+                        'name': self.gpu_names[i],
+                        'allocated_gb': allocated,
+                        'cached_gb': cached,
+                        'total_gb': total,
+                        'allocated_percent': (allocated / total) * 100 if total > 0 else 0
                     })
                 
-                time.sleep(interval)
-                
+                snapshot['gpu'] = gpu_info
             except Exception as e:
-                logger.debug(f"Error in resource monitoring: {e}")
-                time.sleep(interval)
-    
-    def get_averages(self) -> Dict[str, float]:
-        """Get average resource usage statistics"""
-        with self._lock:
-            cpu_avg = sum(self.cpu_usage_samples) / len(self.cpu_usage_samples) if self.cpu_usage_samples else 0
-            ram_avg = sum(self.ram_usage_samples) / len(self.ram_usage_samples) if self.ram_usage_samples else 0
-            
-            gpu_memory_mb_avg = 0
-            gpu_memory_percent_avg = 0
-            if self.gpu_memory_samples:
-                gpu_memory_mb_avg = sum(sample['memory_mb'] for sample in self.gpu_memory_samples) / len(self.gpu_memory_samples)
-                gpu_memory_percent_avg = sum(sample['memory_percent'] for sample in self.gpu_memory_samples) / len(self.gpu_memory_samples)
+                snapshot['gpu_error'] = str(e)
         
-        return {
-            'cpu_usage_avg': cpu_avg,
-            'ram_usage_avg': ram_avg,
-            'gpu_memory_mb_avg': gpu_memory_mb_avg,
-            'gpu_memory_percent_avg': gpu_memory_percent_avg,
-            'sample_count': len(self.cpu_usage_samples),
-            'cuda_available': self.cuda_available
-        }
+        return snapshot
     
-    def clear_samples(self):
-        """Clear all collected samples"""
+    def calculate_averages(self) -> Dict[str, Any]:
+        """Calculate average resource usage statistics"""
         with self._lock:
+            if not self.cpu_samples:
+                return {'error': 'No samples collected'}
+            
+            # CPU averages
+            cpu_avg = sum(self.cpu_samples) / len(self.cpu_samples)
+            cpu_max = max(self.cpu_samples)
+            cpu_min = min(self.cpu_samples)
+            
+            # RAM averages
+            ram_percents = [sample['percent'] for sample in self.ram_samples]
+            ram_used_gbs = [sample['used_gb'] for sample in self.ram_samples]
+            
+            ram_percent_avg = sum(ram_percents) / len(ram_percents)
+            ram_used_avg = sum(ram_used_gbs) / len(ram_used_gbs)
+            ram_percent_max = max(ram_percents)
+            ram_used_max = max(ram_used_gbs)
+            
+            averages = {
+                'sample_count': len(self.cpu_samples),
+                'cpu': {
+                    'average_percent': cpu_avg,
+                    'max_percent': cpu_max,
+                    'min_percent': cpu_min
+                },
+                'ram': {
+                    'average_percent': ram_percent_avg,
+                    'average_used_gb': ram_used_avg,
+                    'max_percent': ram_percent_max,
+                    'max_used_gb': ram_used_max
+                }
+            }
+            
+            # GPU averages if available
+            if self.gpu_memory_samples and self.cuda_available:
+                gpu_averages = {}
+                
+                for device_id in range(self.gpu_count):
+                    device_samples = []
+                    for sample_set in self.gpu_memory_samples:
+                        for gpu_sample in sample_set:
+                            if gpu_sample.get('device') == device_id and 'error' not in gpu_sample:
+                                device_samples.append(gpu_sample)
+                    
+                    if device_samples:
+                        avg_allocated = sum(s['allocated_gb'] for s in device_samples) / len(device_samples)
+                        avg_cached = sum(s['cached_gb'] for s in device_samples) / len(device_samples)
+                        avg_allocated_percent = sum(s['allocated_percent'] for s in device_samples) / len(device_samples)
+                        max_allocated = max(s['allocated_gb'] for s in device_samples)
+                        max_allocated_percent = max(s['allocated_percent'] for s in device_samples)
+                        
+                        gpu_averages[f'gpu_{device_id}'] = {
+                            'name': self.gpu_names[device_id] if device_id < len(self.gpu_names) else f'GPU {device_id}',
+                            'total_gb': self.gpu_total_memory[device_id] if device_id < len(self.gpu_total_memory) else 0,
+                            'average_allocated_gb': avg_allocated,
+                            'average_cached_gb': avg_cached,
+                            'average_allocated_percent': avg_allocated_percent,
+                            'max_allocated_gb': max_allocated,
+                            'max_allocated_percent': max_allocated_percent,
+                            'sample_count': len(device_samples)
+                        }
+                
+                averages['gpu'] = gpu_averages
+                
+                # Overall GPU summary
+                if gpu_averages:
+                    total_avg_allocated = sum(gpu['average_allocated_gb'] for gpu in gpu_averages.values())
+                    total_max_allocated = sum(gpu['max_allocated_gb'] for gpu in gpu_averages.values())
+                    total_capacity = sum(gpu['total_gb'] for gpu in gpu_averages.values())
+                    
+                    averages['gpu_summary'] = {
+                        'total_average_allocated_gb': total_avg_allocated,
+                        'total_max_allocated_gb': total_max_allocated,
+                        'total_capacity_gb': total_capacity,
+                        'average_utilization_percent': (total_avg_allocated / total_capacity) * 100 if total_capacity > 0 else 0,
+                        'max_utilization_percent': (total_max_allocated / total_capacity) * 100 if total_capacity > 0 else 0
+                    }
+            
+            return averages
+    
+    def reset_samples(self):
+        """Reset all collected samples"""
+        with self._lock:
+            self.cpu_samples.clear()
+            self.ram_samples.clear()
             self.gpu_memory_samples.clear()
-            self.cpu_usage_samples.clear()
-            self.ram_usage_samples.clear()
+            self.gpu_utilization_samples.clear()
+    
+    def print_current_status(self, prefix: str = ""):
+        """Print current system resource status"""
+        snapshot = self.get_current_snapshot()
+        
+        output = f"{prefix}CPU: {snapshot['cpu_percent']:.1f}% | "
+        output += f"RAM: {snapshot['memory']['percent']:.1f}% ({snapshot['memory']['used']/1024**3:.1f}GB)"
+        
+        if 'gpu' in snapshot:
+            gpu_info = snapshot['gpu']
+            total_gpu_allocated = sum(gpu['allocated_gb'] for gpu in gpu_info)
+            total_gpu_capacity = sum(gpu['total_gb'] for gpu in gpu_info)
+            gpu_percent = (total_gpu_allocated / total_gpu_capacity) * 100 if total_gpu_capacity > 0 else 0
+            output += f" | GPU: {gpu_percent:.1f}% ({total_gpu_allocated:.1f}GB)"
+        
+        print(output)
 
 class EightBitBatchProcessor:
-    """Enhanced batch processor for 8-bit mixed precision Kosmos-2.5 models"""
+    """Enhanced batch processor with comprehensive resource monitoring"""
     
     def __init__(self, 
                  model_checkpoint: str,
@@ -167,21 +342,11 @@ class EightBitBatchProcessor:
                  mixed_precision: bool = True,
                  force_fallback: bool = False,
                  max_workers: int = 1,
-                 use_process_pool: bool = False):
-        """
-        Initialize the 8-bit mixed precision batch processor
+                 use_process_pool: bool = False,
+                 enable_resource_monitoring: bool = True):
+        """Initialize the batch processor with resource monitoring"""
         
-        Args:
-            model_checkpoint (str): Path to model checkpoint (local directory or HuggingFace model name)
-            device (str): Device to use for inference
-            cache_dir (str): Cache directory for models
-            use_8bit (bool): Enable 8-bit quantization
-            mixed_precision (bool): Enable mixed precision for critical layers
-            force_fallback (bool): Force use of fallback mode (no 8-bit)
-            max_workers (int): Maximum number of parallel workers
-            use_process_pool (bool): Use process pool instead of thread pool for true parallelism
-        """
-        debug_checkpoint("Initializing EightBitBatchProcessor", "BATCH_INIT_START")
+        debug_checkpoint("Initializing EightBitBatchProcessor with Resource Monitoring", "BATCH_INIT_START")
         
         self.model_checkpoint = model_checkpoint
         self.device = device
@@ -191,6 +356,10 @@ class EightBitBatchProcessor:
         self.force_fallback = force_fallback
         self.max_workers = max_workers
         self.use_process_pool = use_process_pool
+        self.enable_resource_monitoring = enable_resource_monitoring
+        
+        # Initialize resource monitor
+        self.resource_monitor = SystemResourceMonitor(enable_gpu_monitoring=True)
         
         # Validate model checkpoint
         self.is_local_checkpoint = os.path.exists(model_checkpoint)
@@ -207,39 +376,44 @@ class EightBitBatchProcessor:
         self.start_time = None
         self.system_info = self._get_system_info()
         
-        # Resource monitoring
-        self.resource_monitor = ResourceMonitor()
-        
-        logger.info(f"Initialized 8-bit Mixed Precision Batch Processor")
+        logger.info(f"Initialized 8-bit Mixed Precision Batch Processor with Resource Monitoring")
         logger.info(f"Model checkpoint: {self.model_checkpoint}")
-        logger.info(f"Local checkpoint: {self.is_local_checkpoint}")
         logger.info(f"Device: {self.device}")
         logger.info(f"8-bit quantization: {self.use_8bit}")
-        logger.info(f"Mixed precision: {self.mixed_precision}")
-        logger.info(f"Force fallback: {self.force_fallback}")
-        logger.info(f"Max workers: {self.max_workers}")
-        logger.info(f"Use process pool: {self.use_process_pool}")
+        logger.info(f"Resource monitoring: {self.enable_resource_monitoring}")
         
         debug_checkpoint("EightBitBatchProcessor initialization completed", "BATCH_INIT_END")
     
     def _get_system_info(self) -> Dict[str, Any]:
-        """Get system information for performance analysis"""
+        """Get comprehensive system information"""
         try:
             import torch
-            return {
-                'cpu_count': psutil.cpu_count(logical=False),
+            system_info = {
+                'cpu_count_physical': psutil.cpu_count(logical=False),
                 'cpu_count_logical': psutil.cpu_count(logical=True),
                 'memory_total_gb': psutil.virtual_memory().total / (1024**3),
                 'cuda_available': torch.cuda.is_available(),
                 'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                'cuda_memory_gb': torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
             }
+            
+            if torch.cuda.is_available():
+                gpu_info = []
+                for i in range(torch.cuda.device_count()):
+                    props = torch.cuda.get_device_properties(i)
+                    gpu_info.append({
+                        'name': torch.cuda.get_device_name(i),
+                        'memory_gb': props.total_memory / (1024**3),
+                        'compute_capability': f"{props.major}.{props.minor}"
+                    })
+                system_info['gpu_devices'] = gpu_info
+            
+            return system_info
         except Exception as e:
-            debug_checkpoint(f"Failed to get system info: {e}")
+            logger.debug(f"Failed to get system info: {e}")
             return {}
     
     def _get_ocr_engine(self) -> EightBitOCRInference:
-        """Get thread-local OCR engine with proper initialization"""
+        """Get thread-local OCR engine"""
         if not hasattr(self._local, 'ocr_engine') or self._local.ocr_engine is None:
             debug_checkpoint("Creating thread-local OCR engine")
             try:
@@ -258,7 +432,7 @@ class EightBitBatchProcessor:
         return self._local.ocr_engine
     
     def _get_md_engine(self) -> EightBitMarkdownInference:
-        """Get thread-local Markdown engine with proper initialization"""
+        """Get thread-local Markdown engine"""
         if not hasattr(self._local, 'md_engine') or self._local.md_engine is None:
             debug_checkpoint("Creating thread-local Markdown engine")
             try:
@@ -277,7 +451,7 @@ class EightBitBatchProcessor:
         return self._local.md_engine
     
     def find_images(self, input_folder: str, extensions: List[str]) -> List[str]:
-        """Find all image files in the input folder with enhanced filtering"""
+        """Find and validate image files"""
         debug_checkpoint(f"Scanning for images in: {input_folder}", "FIND_IMAGES_START")
         
         image_files = []
@@ -291,7 +465,6 @@ class EightBitBatchProcessor:
         
         # Search for images with case-insensitive extensions
         for ext in extensions:
-            # Search for both lowercase and uppercase extensions
             for case_ext in [ext.lower(), ext.upper()]:
                 pattern = f"*{case_ext}"
                 found_files = list(input_path.glob(pattern))
@@ -307,7 +480,6 @@ class EightBitBatchProcessor:
             try:
                 from PIL import Image
                 with Image.open(img_file) as img:
-                    # Quick validation
                     img.verify()
                 valid_images.append(img_file)
             except Exception as e:
@@ -319,15 +491,12 @@ class EightBitBatchProcessor:
         return valid_images
     
     def create_output_structure(self, output_folder: str) -> Dict[str, str]:
-        """Create comprehensive output folder structure with detailed organization"""
+        """Create comprehensive output folder structure"""
         debug_checkpoint(f"Creating output structure: {output_folder}", "OUTPUT_STRUCT_START")
         
         output_path = Path(output_folder)
-        
-        # Create main output folder
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Create comprehensive subfolders
         folders = {
             'markdown': output_path / "markdown_output",
             'ocr_images': output_path / "ocr_annotated_images", 
@@ -343,7 +512,6 @@ class EightBitBatchProcessor:
             folder_path.mkdir(exist_ok=True)
             debug_checkpoint(f"Created folder: {folder_name} -> {folder_path}")
         
-        # Convert to strings for easier handling
         folder_paths = {k: str(v) for k, v in folders.items()}
         
         logger.info("Created comprehensive output folder structure:")
@@ -358,7 +526,7 @@ class EightBitBatchProcessor:
                                 output_folders: Dict[str, str],
                                 max_tokens: int,
                                 task_id: int = 0) -> Dict[str, Any]:
-        """Process a single image for OCR with comprehensive error handling"""
+        """Process a single image for OCR with error handling"""
         image_name = Path(image_path).stem
         start_time = time.time()
         
@@ -373,9 +541,13 @@ class EightBitBatchProcessor:
             output_text = Path(output_folders['ocr_text']) / f"{image_name}_ocr_results.txt"
             
             logger.info(f"[Task {task_id}] Processing OCR for: {Path(image_path).name}")
+            
+            if self.enable_resource_monitoring:
+                self.resource_monitor.print_current_status(f"[Task {task_id}] Pre-OCR Resources - ")
+            
             debug_memory_status()
             
-            # Perform OCR with comprehensive error handling
+            # Perform OCR
             result = ocr_engine.perform_ocr(
                 image_path=image_path,
                 max_tokens=max_tokens,
@@ -385,7 +557,10 @@ class EightBitBatchProcessor:
             
             processing_time = time.time() - start_time
             
-            # Extract comprehensive statistics
+            if self.enable_resource_monitoring:
+                self.resource_monitor.print_current_status(f"[Task {task_id}] Post-OCR Resources - ")
+            
+            # Extract statistics
             stats = result.get('statistics', {})
             
             success_result = {
@@ -414,7 +589,7 @@ class EightBitBatchProcessor:
             error_msg = f"OCR failed for {Path(image_path).name}: {str(e)}"
             logger.error(error_msg)
             
-            # Save detailed error information
+            # Save error information
             error_file = Path(output_folders['errors']) / f"{image_name}_ocr_error.txt"
             try:
                 with open(error_file, 'w', encoding='utf-8') as f:
@@ -427,7 +602,7 @@ class EightBitBatchProcessor:
                     f.write(f"Full traceback:\n")
                     f.write(traceback.format_exc())
             except Exception:
-                pass  # Don't fail on error logging
+                pass
             
             error_result = {
                 'success': False,
@@ -449,7 +624,7 @@ class EightBitBatchProcessor:
                                     max_tokens: int,
                                     temperature: float,
                                     task_id: int = 0) -> Dict[str, Any]:
-        """Process a single image for Markdown generation with comprehensive error handling"""
+        """Process a single image for Markdown generation"""
         image_name = Path(image_path).stem
         start_time = time.time()
         
@@ -463,9 +638,13 @@ class EightBitBatchProcessor:
             output_file = Path(output_folders['markdown']) / f"{image_name}_document.md"
             
             logger.info(f"[Task {task_id}] Processing Markdown for: {Path(image_path).name}")
+            
+            if self.enable_resource_monitoring:
+                self.resource_monitor.print_current_status(f"[Task {task_id}] Pre-MD Resources - ")
+            
             debug_memory_status()
             
-            # Generate markdown with comprehensive error handling
+            # Generate markdown
             result = md_engine.generate_markdown(
                 image_path=image_path,
                 max_tokens=max_tokens,
@@ -475,7 +654,10 @@ class EightBitBatchProcessor:
             
             processing_time = time.time() - start_time
             
-            # Extract comprehensive statistics
+            if self.enable_resource_monitoring:
+                self.resource_monitor.print_current_status(f"[Task {task_id}] Post-MD Resources - ")
+            
+            # Extract statistics
             stats = result.get('statistics', {})
             
             success_result = {
@@ -506,7 +688,7 @@ class EightBitBatchProcessor:
             error_msg = f"Markdown generation failed for {Path(image_path).name}: {str(e)}"
             logger.error(error_msg)
             
-            # Save detailed error information
+            # Save error information
             error_file = Path(output_folders['errors']) / f"{image_name}_md_error.txt"
             try:
                 with open(error_file, 'w', encoding='utf-8') as f:
@@ -519,7 +701,7 @@ class EightBitBatchProcessor:
                     f.write(f"Full traceback:\n")
                     f.write(traceback.format_exc())
             except Exception:
-                pass  # Don't fail on error logging
+                pass
             
             error_result = {
                 'success': False,
@@ -543,11 +725,12 @@ class EightBitBatchProcessor:
                                ocr_max_tokens: int,
                                md_max_tokens: int,
                                temperature: float) -> Dict[str, Any]:
-        """Process images sequentially with detailed progress tracking"""
+        """Process images sequentially with resource monitoring"""
         debug_checkpoint("Starting sequential batch processing", "BATCH_SEQ_START")
         
         # Start resource monitoring
-        self.resource_monitor.start_monitoring(interval=0.5)
+        if self.enable_resource_monitoring:
+            self.resource_monitor.start_monitoring(sample_interval=0.5)
         
         results = {
             'ocr_results': [],
@@ -574,7 +757,6 @@ class EightBitBatchProcessor:
                     results['ocr_results'].append(ocr_result)
                     self.completed_tasks += 1
                     
-                    # Progress update
                     progress = (self.completed_tasks / self.total_tasks) * 100
                     logger.info(f"Progress: {progress:.1f}% ({self.completed_tasks}/{self.total_tasks})")
                 
@@ -587,15 +769,14 @@ class EightBitBatchProcessor:
                     results['md_results'].append(md_result)
                     self.completed_tasks += 1
                     
-                    # Progress update
                     progress = (self.completed_tasks / self.total_tasks) * 100
                     logger.info(f"Progress: {progress:.1f}% ({self.completed_tasks}/{self.total_tasks})")
         
         finally:
-            # Stop resource monitoring and get averages
-            self.resource_monitor.stop_monitoring()
-            resource_stats = self.resource_monitor.get_averages()
-            results['resource_usage'] = resource_stats
+            # Stop resource monitoring and collect averages
+            if self.enable_resource_monitoring:
+                self.resource_monitor.stop_monitoring()
+                results['resource_averages'] = self.resource_monitor.calculate_averages()
         
         results['end_time'] = time.time()
         results['total_time'] = results['end_time'] - results['start_time']
@@ -611,11 +792,12 @@ class EightBitBatchProcessor:
                              ocr_max_tokens: int,
                              md_max_tokens: int,
                              temperature: float) -> Dict[str, Any]:
-        """Process images in parallel with enhanced resource management"""
+        """Process images in parallel with resource monitoring"""
         debug_checkpoint("Starting parallel batch processing", "BATCH_PAR_START")
         
         # Start resource monitoring
-        self.resource_monitor.start_monitoring(interval=0.5)
+        if self.enable_resource_monitoring:
+            self.resource_monitor.start_monitoring(sample_interval=0.5)
         
         results = {
             'ocr_results': [],
@@ -628,13 +810,8 @@ class EightBitBatchProcessor:
         self.total_tasks = len(image_paths) * (int(process_ocr) + int(process_md))
         self.completed_tasks = 0
         
-        # Choose executor type based on configuration
-        if self.use_process_pool:
-            executor_class = ProcessPoolExecutor
-            logger.info(f"Using ProcessPoolExecutor with {self.max_workers} workers")
-        else:
-            executor_class = ThreadPoolExecutor
-            logger.info(f"Using ThreadPoolExecutor with {self.max_workers} workers")
+        executor_class = ProcessPoolExecutor if self.use_process_pool else ThreadPoolExecutor
+        logger.info(f"Using {executor_class.__name__} with {self.max_workers} workers")
         
         try:
             with executor_class(max_workers=self.max_workers) as executor:
@@ -661,7 +838,7 @@ class EightBitBatchProcessor:
                         )
                         futures.append(('md', future, task_id))
                 
-                # Collect results with progress tracking
+                # Collect results
                 for task_type, future in as_completed([f[1] for f in futures]):
                     self.completed_tasks += 1
                     progress = (self.completed_tasks / self.total_tasks) * 100
@@ -674,7 +851,6 @@ class EightBitBatchProcessor:
                         else:
                             results['md_results'].append(result)
                             
-                        # Log success/failure
                         if result.get('success', False):
                             logger.info(f"✓ {task_type.upper()} task completed: {result.get('image_name', 'unknown')}")
                         else:
@@ -684,10 +860,10 @@ class EightBitBatchProcessor:
                         logger.error(f"Task execution failed: {e}")
         
         finally:
-            # Stop resource monitoring and get averages
-            self.resource_monitor.stop_monitoring()
-            resource_stats = self.resource_monitor.get_averages()
-            results['resource_usage'] = resource_stats
+            # Stop resource monitoring and collect averages
+            if self.enable_resource_monitoring:
+                self.resource_monitor.stop_monitoring()
+                results['resource_averages'] = self.resource_monitor.calculate_averages()
         
         results['end_time'] = time.time()
         results['total_time'] = results['end_time'] - results['start_time']
@@ -695,183 +871,13 @@ class EightBitBatchProcessor:
         debug_checkpoint("Parallel batch processing completed", "BATCH_PAR_END")
         return results
     
-    def create_performance_report(self, 
-                                results: Dict[str, Any], 
-                                output_folders: Dict[str, str]) -> str:
-        """Create detailed performance analysis report"""
-        debug_checkpoint("Creating performance report", "PERF_REPORT_START")
-        
-        performance_file = Path(output_folders['performance']) / "performance_analysis.json"
-        
-        # Extract performance metrics
-        ocr_results = results.get('ocr_results', [])
-        md_results = results.get('md_results', [])
-        resource_usage = results.get('resource_usage', {})
-        
-        ocr_successful = [r for r in ocr_results if r.get('success', False)]
-        md_successful = [r for r in md_results if r.get('success', False)]
-        
-        # Calculate performance statistics
-        performance_data = {
-            'system_info': self.system_info,
-            'configuration': {
-                'model_checkpoint': self.model_checkpoint,
-                'is_local_checkpoint': self.is_local_checkpoint,
-                'use_8bit': self.use_8bit,
-                'mixed_precision': self.mixed_precision,
-                'force_fallback': self.force_fallback,
-                'max_workers': self.max_workers,
-                'use_process_pool': self.use_process_pool,
-                'processing_mode': results.get('processing_mode', 'unknown')
-            },
-            'resource_usage_averages': resource_usage,
-            'timing_analysis': {
-                'total_processing_time': results.get('total_time', 0),
-                'images_processed': results.get('total_images', 0),
-                'average_time_per_image': results.get('total_time', 0) / max(results.get('total_images', 1), 1),
-                'ocr_processing_times': [r.get('processing_time', 0) for r in ocr_successful],
-                'md_processing_times': [r.get('processing_time', 0) for r in md_successful],
-                'ocr_inference_times': [r.get('inference_time', 0) for r in ocr_successful],
-                'md_inference_times': [r.get('inference_time', 0) for r in md_successful]
-            },
-            'quantization_analysis': {
-                'ocr_quantization_used': [r.get('quantization_used', 'unknown') for r in ocr_successful],
-                'md_quantization_used': [r.get('quantization_used', 'unknown') for r in md_successful],
-            },
-            'error_analysis': {
-                'ocr_errors': [r for r in ocr_results if not r.get('success', False)],
-                'md_errors': [r for r in md_results if not r.get('success', False)],
-                'ocr_error_rate': len([r for r in ocr_results if not r.get('success', False)]) / max(len(ocr_results), 1),
-                'md_error_rate': len([r for r in md_results if not r.get('success', False)]) / max(len(md_results), 1)
-            },
-            'throughput_metrics': {
-                'images_per_second': results.get('total_images', 0) / max(results.get('total_time', 1), 1),
-                'ocr_regions_per_second': sum(r.get('text_regions', 0) for r in ocr_successful) / max(results.get('total_time', 1), 1),
-                'md_words_per_second': sum(r.get('word_count', 0) for r in md_successful) / max(results.get('total_time', 1), 1)
-            }
-        }
-        
-        # Save performance report
-        with open(performance_file, 'w', encoding='utf-8') as f:
-            json.dump(performance_data, f, indent=2, ensure_ascii=False, default=str)
-        
-        logger.info(f"Performance analysis saved to: {performance_file}")
-        debug_checkpoint("Performance report creation completed", "PERF_REPORT_END")
-        
-        return str(performance_file)
-    
-    def create_comprehensive_report(self, 
-                                  results: Dict[str, Any], 
-                                  output_folders: Dict[str, str],
-                                  config: Dict[str, Any]) -> str:
-        """Create comprehensive processing report with detailed analysis"""
-        debug_checkpoint("Creating comprehensive report", "COMP_REPORT_START")
-        
-        report_file = Path(output_folders['reports']) / "comprehensive_processing_report.json"
-        
-        # Extract results
-        ocr_results = results.get('ocr_results', [])
-        md_results = results.get('md_results', [])
-        resource_usage = results.get('resource_usage', {})
-        
-        ocr_successful = [r for r in ocr_results if r.get('success', False)]
-        ocr_failed = [r for r in ocr_results if not r.get('success', False)]
-        md_successful = [r for r in md_results if r.get('success', False)]
-        md_failed = [r for r in md_results if not r.get('success', False)]
-        
-        # Calculate comprehensive statistics
-        total_text_regions = sum(r.get('text_regions', 0) for r in ocr_successful)
-        total_words = sum(r.get('word_count', 0) for r in md_successful)
-        total_chars = sum(r.get('char_count', 0) for r in md_successful)
-        
-        # Create comprehensive report
-        report = {
-            'metadata': {
-                'report_generated': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'processor_version': '8-bit Mixed Precision Batch Processor v1.0',
-                'system_info': self.system_info
-            },
-            'configuration': config,
-            'resource_usage_averages': resource_usage,
-            'processing_summary': {
-                'total_images': results['total_images'],
-                'total_processing_time': results['total_time'],
-                'average_time_per_image': results['total_time'] / max(results['total_images'], 1),
-                'processing_mode': results.get('processing_mode', 'unknown'),
-                'tasks_completed': len(ocr_results) + len(md_results),
-                'overall_success_rate': len(ocr_successful + md_successful) / max(len(ocr_results + md_results), 1)
-            },
-            'ocr_analysis': {
-                'total_processed': len(ocr_results),
-                'successful': len(ocr_successful),
-                'failed': len(ocr_failed),
-                'success_rate': len(ocr_successful) / max(len(ocr_results), 1),
-                'total_text_regions_found': total_text_regions,
-                'average_regions_per_image': total_text_regions / max(len(ocr_successful), 1),
-                'average_processing_time': sum(r.get('processing_time', 0) for r in ocr_successful) / max(len(ocr_successful), 1),
-                'average_inference_time': sum(r.get('inference_time', 0) for r in ocr_successful) / max(len(ocr_successful), 1),
-                'quantization_distribution': {},
-                'error_types': {}
-            },
-            'markdown_analysis': {
-                'total_processed': len(md_results),
-                'successful': len(md_successful),
-                'failed': len(md_failed),
-                'success_rate': len(md_successful) / max(len(md_results), 1),
-                'total_words_generated': total_words,
-                'total_characters_generated': total_chars,
-                'average_words_per_image': total_words / max(len(md_successful), 1),
-                'average_processing_time': sum(r.get('processing_time', 0) for r in md_successful) / max(len(md_successful), 1),
-                'average_inference_time': sum(r.get('inference_time', 0) for r in md_successful) / max(len(md_successful), 1),
-                'content_analysis': {
-                    'total_headers': sum(r.get('headers', 0) for r in md_successful),
-                    'total_lists': sum(r.get('lists', 0) for r in md_successful),
-                    'total_tables': sum(r.get('tables', 0) for r in md_successful),
-                    'total_code_blocks': sum(r.get('code_blocks', 0) for r in md_successful)
-                },
-                'quantization_distribution': {},
-                'error_types': {}
-            },
-            'detailed_results': {
-                'ocr_results': ocr_results,
-                'markdown_results': md_results
-            }
-        }
-        
-        # Analyze quantization usage
-        for r in ocr_successful:
-            quant = r.get('quantization_used', 'unknown')
-            report['ocr_analysis']['quantization_distribution'][quant] = report['ocr_analysis']['quantization_distribution'].get(quant, 0) + 1
-        
-        for r in md_successful:
-            quant = r.get('quantization_used', 'unknown')
-            report['markdown_analysis']['quantization_distribution'][quant] = report['markdown_analysis']['quantization_distribution'].get(quant, 0) + 1
-        
-        # Analyze error types
-        for r in ocr_failed:
-            error_type = r.get('error_type', 'unknown')
-            report['ocr_analysis']['error_types'][error_type] = report['ocr_analysis']['error_types'].get(error_type, 0) + 1
-        
-        for r in md_failed:
-            error_type = r.get('error_type', 'unknown')
-            report['markdown_analysis']['error_types'][error_type] = report['markdown_analysis']['error_types'].get(error_type, 0) + 1
-        
-        # Save comprehensive report
-        with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
-        
-        logger.info(f"Comprehensive report saved to: {report_file}")
-        debug_checkpoint("Comprehensive report creation completed", "COMP_REPORT_END")
-        
-        return str(report_file)
-    
     def print_detailed_summary(self, results: Dict[str, Any], config: Dict[str, Any]):
-        """Print detailed, formatted summary of processing results"""
+        """Print detailed summary with resource usage averages"""
         debug_checkpoint("Generating detailed summary", "SUMMARY_START")
         
         ocr_results = results.get('ocr_results', [])
         md_results = results.get('md_results', [])
-        resource_usage = results.get('resource_usage', {})
+        resource_averages = results.get('resource_averages', {})
         
         ocr_successful = [r for r in ocr_results if r.get('success', False)]
         md_successful = [r for r in md_results if r.get('success', False)]
@@ -879,21 +885,18 @@ class EightBitBatchProcessor:
         total_text_regions = sum(r.get('text_regions', 0) for r in ocr_successful)
         total_words = sum(r.get('word_count', 0) for r in md_successful)
         
-        # Print comprehensive summary
         print(f"\n{'='*100}")
-        print("8-BIT MIXED PRECISION BATCH PROCESSING SUMMARY")
+        print("8-BIT MIXED PRECISION BATCH PROCESSING SUMMARY WITH RESOURCE MONITORING")
         print(f"{'='*100}")
         
         print(f"\n📋 CONFIGURATION:")
         print(f"  Model Checkpoint: {config['model_checkpoint']}")
-        print(f"  Local Model: {'Yes' if self.is_local_checkpoint else 'No'}")
         print(f"  Device: {config['device'] or 'Auto-detected'}")
         print(f"  8-bit Quantization: {'Enabled' if config['use_8bit'] else 'Disabled'}")
         print(f"  Mixed Precision: {'Enabled' if config['mixed_precision'] else 'Disabled'}")
-        print(f"  Force Fallback: {'Yes' if config['force_fallback'] else 'No'}")
         print(f"  Max Workers: {config['max_workers']}")
         print(f"  Processing Mode: {results.get('processing_mode', 'Unknown').title()}")
-        print(f"  Executor Type: {'Process Pool' if self.use_process_pool else 'Thread Pool'}")
+        print(f"  Resource Monitoring: {'Enabled' if self.enable_resource_monitoring else 'Disabled'}")
         
         print(f"\n⏱️  PERFORMANCE METRICS:")
         print(f"  Total Images: {results['total_images']}")
@@ -902,15 +905,42 @@ class EightBitBatchProcessor:
         print(f"  Images per Second: {results['total_images']/max(results['total_time'], 1):.2f}")
         
         # Print resource usage averages
-        if resource_usage:
-            print(f"\n📊 RESOURCE USAGE AVERAGES:")
-            print(f"  CPU Usage: {resource_usage.get('cpu_usage_avg', 0):.1f}%")
-            print(f"  RAM Usage: {resource_usage.get('ram_usage_avg', 0):.1f}%")
-            if resource_usage.get('cuda_available', False):
-                print(f"  GPU Memory Usage: {resource_usage.get('gpu_memory_mb_avg', 0):.1f} MB ({resource_usage.get('gpu_memory_percent_avg', 0):.1f}%)")
+        if resource_averages and 'sample_count' in resource_averages:
+            print(f"\n📊 RESOURCE USAGE AVERAGES ACROSS ALL BATCHES:")
+            print(f"  Monitoring Samples: {resource_averages['sample_count']:,}")
+            
+            cpu_data = resource_averages.get('cpu', {})
+            print(f"  CPU Usage:")
+            print(f"    Average: {cpu_data.get('average_percent', 0):.1f}%")
+            print(f"    Max: {cpu_data.get('max_percent', 0):.1f}%")
+            print(f"    Min: {cpu_data.get('min_percent', 0):.1f}%")
+            
+            ram_data = resource_averages.get('ram', {})
+            print(f"  RAM Usage:")
+            print(f"    Average: {ram_data.get('average_percent', 0):.1f}% ({ram_data.get('average_used_gb', 0):.1f} GB)")
+            print(f"    Max: {ram_data.get('max_percent', 0):.1f}% ({ram_data.get('max_used_gb', 0):.1f} GB)")
+            
+            gpu_data = resource_averages.get('gpu', {})
+            gpu_summary = resource_averages.get('gpu_summary', {})
+            
+            if gpu_data:
+                print(f"  GPU Memory Usage:")
+                for gpu_id, gpu_info in gpu_data.items():
+                    print(f"    {gpu_info['name']}:")
+                    print(f"      Average Allocated: {gpu_info['average_allocated_gb']:.1f} GB ({gpu_info['average_allocated_percent']:.1f}%)")
+                    print(f"      Max Allocated: {gpu_info['max_allocated_gb']:.1f} GB ({gpu_info['max_allocated_percent']:.1f}%)")
+                    print(f"      Total Capacity: {gpu_info['total_gb']:.1f} GB")
+                
+                if gpu_summary:
+                    print(f"  Overall GPU Summary:")
+                    print(f"    Total Average Allocated: {gpu_summary['total_average_allocated_gb']:.1f} GB ({gpu_summary['average_utilization_percent']:.1f}%)")
+                    print(f"    Total Max Allocated: {gpu_summary['total_max_allocated_gb']:.1f} GB ({gpu_summary['max_utilization_percent']:.1f}%)")
+                    print(f"    Total GPU Capacity: {gpu_summary['total_capacity_gb']:.1f} GB")
             else:
-                print(f"  GPU Memory Usage: N/A (CUDA not available)")
-            print(f"  Sample Count: {resource_usage.get('sample_count', 0)} measurements")
+                print(f"  GPU Memory Usage: N/A (No GPU detected or monitoring disabled)")
+        else:
+            print(f"\n📊 RESOURCE USAGE MONITORING:")
+            print(f"  Status: Disabled or no samples collected")
         
         if ocr_results:
             print(f"\n🔍 OCR PROCESSING RESULTS:")
@@ -920,19 +950,6 @@ class EightBitBatchProcessor:
             print(f"  Success Rate: {(len(ocr_successful)/max(len(ocr_results), 1))*100:.1f}%")
             print(f"  Total Text Regions Found: {total_text_regions:,}")
             print(f"  Average Regions per Image: {total_text_regions/max(len(ocr_successful), 1):.1f}")
-            
-            if ocr_successful:
-                avg_proc_time = sum(r.get('processing_time', 0) for r in ocr_successful) / len(ocr_successful)
-                avg_inf_time = sum(r.get('inference_time', 0) for r in ocr_successful) / len(ocr_successful)
-                print(f"  Average Processing Time: {avg_proc_time:.2f}s")
-                print(f"  Average Inference Time: {avg_inf_time:.2f}s")
-                
-                # Quantization usage
-                quant_usage = {}
-                for r in ocr_successful:
-                    quant = r.get('quantization_used', 'unknown')
-                    quant_usage[quant] = quant_usage.get(quant, 0) + 1
-                print(f"  Quantization Usage: {dict(quant_usage)}")
         
         if md_results:
             print(f"\n📝 MARKDOWN GENERATION RESULTS:")
@@ -942,48 +959,25 @@ class EightBitBatchProcessor:
             print(f"  Success Rate: {(len(md_successful)/max(len(md_results), 1))*100:.1f}%")
             print(f"  Total Words Generated: {total_words:,}")
             print(f"  Average Words per Image: {total_words/max(len(md_successful), 1):.0f}")
-            
-            if md_successful:
-                total_headers = sum(r.get('headers', 0) for r in md_successful)
-                total_lists = sum(r.get('lists', 0) for r in md_successful)
-                total_tables = sum(r.get('tables', 0) for r in md_successful)
-                total_code_blocks = sum(r.get('code_blocks', 0) for r in md_successful)
-                
-                avg_proc_time = sum(r.get('processing_time', 0) for r in md_successful) / len(md_successful)
-                avg_inf_time = sum(r.get('inference_time', 0) for r in md_successful) / len(md_successful)
-                print(f"  Average Processing Time: {avg_proc_time:.2f}s")
-                print(f"  Average Inference Time: {avg_inf_time:.2f}s")
-                print(f"  Content Elements:")
-                print(f"    Headers: {total_headers}")
-                print(f"    Lists: {total_lists}")
-                print(f"    Tables: {total_tables}")
-                print(f"    Code Blocks: {total_code_blocks}")
-                
-                # Quantization usage
-                quant_usage = {}
-                for r in md_successful:
-                    quant = r.get('quantization_used', 'unknown')
-                    quant_usage[quant] = quant_usage.get(quant, 0) + 1
-                print(f"  Quantization Usage: {dict(quant_usage)}")
         
-        # System information
         if self.system_info:
             print(f"\n💻 SYSTEM INFORMATION:")
-            print(f"  CPU Cores: {self.system_info.get('cpu_count', 'Unknown')} physical, {self.system_info.get('cpu_count_logical', 'Unknown')} logical")
+            print(f"  CPU Cores: {self.system_info.get('cpu_count_physical', 'Unknown')} physical, {self.system_info.get('cpu_count_logical', 'Unknown')} logical")
             print(f"  System Memory: {self.system_info.get('memory_total_gb', 0):.1f} GB")
             print(f"  CUDA Available: {'Yes' if self.system_info.get('cuda_available', False) else 'No'}")
-            if self.system_info.get('cuda_available', False):
-                print(f"  CUDA Devices: {self.system_info.get('cuda_device_count', 0)}")
-                print(f"  GPU Memory: {self.system_info.get('cuda_memory_gb', 0):.1f} GB")
+            
+            if self.system_info.get('gpu_devices'):
+                print(f"  GPU Devices:")
+                for i, gpu in enumerate(self.system_info['gpu_devices']):
+                    print(f"    GPU {i}: {gpu['name']} ({gpu['memory_gb']:.1f} GB, Compute {gpu['compute_capability']})")
         
         print(f"\n{'='*100}")
-        
         debug_checkpoint("Detailed summary generation completed", "SUMMARY_END")
 
 def get_args():
-    """Parse command line arguments with comprehensive options"""
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='8-bit Mixed Precision Batch Processor for Kosmos-2.5 with Complete Device Management',
+        description='8-bit Mixed Precision Batch Processor with Resource Monitoring',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -995,34 +989,27 @@ def get_args():
     
     # Model configuration
     parser.add_argument('--model_checkpoint', '-m', type=str, required=True,
-                       help='Path to model checkpoint (local directory or HuggingFace model name)')
+                       help='Path to model checkpoint')
     parser.add_argument('--cache_dir', type=str, default=None,
                        help='Cache directory for model files')
     
-    # Quantization and precision settings
+    # Quantization settings
     parser.add_argument('--no_8bit', action='store_true',
                        help='Disable 8-bit quantization')
     parser.add_argument('--no_mixed_precision', action='store_true',
-                       help='Disable mixed precision for critical layers')
+                       help='Disable mixed precision')
     parser.add_argument('--force_fallback', action='store_true',
-                       help='Force use of fallback mode (no 8-bit quantization)')
+                       help='Force fallback mode')
     
     # Processing configuration
     parser.add_argument('--device', '-d', type=str, default=None,
-                       help='Device to use (auto-detected if not specified)')
-    
-    # Enhanced token size configuration
-    parser.add_argument('--max_tokens', '--tokens', type=int, default=1024,
-                       help='Maximum number of tokens to generate (default: 1024 for OCR, 2048 for markdown)')
-    parser.add_argument('--min_tokens', type=int, default=10,
-                       help='Minimum number of tokens to generate (default: 10)')
-    parser.add_argument('--ocr_tokens', type=int, default=None,
-                       help='Specific token limit for OCR tasks (overrides max_tokens for OCR)')
-    parser.add_argument('--md_tokens', type=int, default=None,
-                       help='Specific token limit for markdown tasks (overrides max_tokens for markdown)')
-    
+                       help='Device to use')
+    parser.add_argument('--max_tokens', type=int, default=1024,
+                       help='Maximum tokens for OCR')
+    parser.add_argument('--md_tokens', type=int, default=2048,
+                       help='Maximum tokens for markdown')
     parser.add_argument('--temperature', '-t', type=float, default=0.1,
-                       help='Sampling temperature for markdown generation (0.0-1.0)')
+                       help='Temperature for markdown generation')
     
     # Task selection
     parser.add_argument('--skip_ocr', action='store_true',
@@ -1032,57 +1019,40 @@ def get_args():
     
     # Performance configuration
     parser.add_argument('--max_workers', type=int, default=1,
-                       help='Maximum number of parallel workers (1 for sequential)')
+                       help='Maximum number of parallel workers')
     parser.add_argument('--parallel', action='store_true',
-                       help='Enable parallel processing (requires max_workers > 1)')
+                       help='Enable parallel processing')
     parser.add_argument('--use_process_pool', action='store_true',
-                       help='Use process pool instead of thread pool for true parallelism')
+                       help='Use process pool')
+    
+    # Resource monitoring
+    parser.add_argument('--no_resource_monitoring', action='store_true',
+                       help='Disable resource monitoring')
     
     # File handling
     parser.add_argument('--image_extensions', type=str, nargs='+', 
                        default=['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'],
                        help='Image file extensions to process')
     
-    # Debug and logging
+    # Debug
     parser.add_argument('--debug', action='store_true',
-                       help='Enable maximum debug output')
+                       help='Enable debug output')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose output')
     
     return parser.parse_args()
 
 def main():
-    """Main execution function with comprehensive error handling"""
-    debug_checkpoint("8-bit Mixed Precision Batch Processor starting", "MAIN_START")
+    """Main execution function"""
+    debug_checkpoint("8-bit Mixed Precision Batch Processor with Resource Monitoring starting", "MAIN_START")
     
     args = get_args()
     
-    # Validate and configure token settings
-    if args.max_tokens < args.min_tokens:
-        logger.error(f"max_tokens ({args.max_tokens}) must be >= min_tokens ({args.min_tokens})")
-        sys.exit(1)
-    
-    # Set task-specific token limits
-    ocr_max_tokens = args.ocr_tokens if args.ocr_tokens is not None else args.max_tokens
-    md_max_tokens = args.md_tokens if args.md_tokens is not None else (args.max_tokens if args.max_tokens != 1024 else 2048)
-    
-    # Validate token limits
-    if ocr_max_tokens > 4096:
-        logger.warning(f"Large OCR token limit ({ocr_max_tokens}) may cause memory issues")
-    if md_max_tokens > 8192:
-        logger.warning(f"Very large markdown token limit ({md_max_tokens}) may cause memory issues")
-    
-    if args.temperature < 0 or args.temperature > 1.0:
-        logger.error(f"Temperature must be between 0.0 and 1.0, got {args.temperature}")
-        sys.exit(1)
-    
-    # Set logging level based on arguments
+    # Set logging level
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-        debug_checkpoint("Debug mode enabled")
     elif args.verbose:
         logging.getLogger().setLevel(logging.INFO)
-        debug_checkpoint("Verbose mode enabled")
     
     # Validate arguments
     if args.skip_ocr and args.skip_md:
@@ -1093,7 +1063,7 @@ def main():
         logger.warning("Parallel processing requested but max_workers <= 1. Using sequential processing.")
         args.parallel = False
     
-    # Create configuration dict
+    # Configuration
     config = {
         'model_checkpoint': args.model_checkpoint,
         'cache_dir': args.cache_dir,
@@ -1102,24 +1072,19 @@ def main():
         'mixed_precision': not args.no_mixed_precision,
         'force_fallback': args.force_fallback,
         'max_tokens': args.max_tokens,
-        'min_tokens': args.min_tokens,
-        'ocr_max_tokens': ocr_max_tokens,
-        'md_max_tokens': md_max_tokens,
+        'md_max_tokens': args.md_tokens,
         'temperature': args.temperature,
         'max_workers': args.max_workers,
         'parallel': args.parallel,
         'use_process_pool': args.use_process_pool,
         'process_ocr': not args.skip_ocr,
         'process_md': not args.skip_md,
-        'image_extensions': args.image_extensions
+        'image_extensions': args.image_extensions,
+        'enable_resource_monitoring': not args.no_resource_monitoring
     }
     
-    debug_checkpoint(f"Configuration: {config}")
-    debug_checkpoint(f"Token configuration - OCR: {ocr_max_tokens}, MD: {md_max_tokens}, Min: {args.min_tokens}")
-    
     try:
-        # Initialize batch processor
-        debug_checkpoint("Initializing 8-bit batch processor")
+        # Initialize processor
         processor = EightBitBatchProcessor(
             model_checkpoint=args.model_checkpoint,
             device=args.device,
@@ -1128,7 +1093,8 @@ def main():
             mixed_precision=not args.no_mixed_precision,
             force_fallback=args.force_fallback,
             max_workers=args.max_workers,
-            use_process_pool=args.use_process_pool
+            use_process_pool=args.use_process_pool,
+            enable_resource_monitoring=not args.no_resource_monitoring
         )
         
         # Find images
@@ -1143,45 +1109,34 @@ def main():
         output_folders = processor.create_output_structure(args.output)
         
         # Process images
-        logger.info(f"Starting 8-bit mixed precision batch processing of {len(image_files)} images")
+        logger.info(f"Starting batch processing of {len(image_files)} images")
         logger.info(f"Processing mode: {'Parallel' if args.parallel else 'Sequential'}")
-        logger.info(f"Token limits - OCR: {ocr_max_tokens}, Markdown: {md_max_tokens}")
         
         if args.parallel:
             results = processor.process_batch_parallel(
                 image_files, output_folders,
                 not args.skip_ocr, not args.skip_md,
-                ocr_max_tokens, md_max_tokens, args.temperature
+                args.max_tokens, args.md_tokens, args.temperature
             )
         else:
             results = processor.process_batch_sequential(
                 image_files, output_folders,
                 not args.skip_ocr, not args.skip_md,
-                ocr_max_tokens, md_max_tokens, args.temperature
+                args.max_tokens, args.md_tokens, args.temperature
             )
-        
-        # Create reports
-        debug_checkpoint("Generating reports")
-        comprehensive_report = processor.create_comprehensive_report(results, output_folders, config)
-        performance_report = processor.create_performance_report(results, output_folders)
         
         # Print summary
         processor.print_detailed_summary(results, config)
         
-        logger.info(f"8-bit mixed precision batch processing completed successfully!")
-        logger.info(f"Comprehensive report: {comprehensive_report}")
-        logger.info(f"Performance analysis: {performance_report}")
-        
+        logger.info(f"Batch processing completed successfully!")
         debug_checkpoint("Application completed successfully", "MAIN_END")
         
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")
-        debug_checkpoint("Application interrupted by user", "MAIN_INTERRUPTED")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Batch processing failed: {e}")
         logger.error(f"Full traceback: {traceback.format_exc()}")
-        debug_checkpoint(f"Application failed with error: {str(e)}", "MAIN_FAILED")
         sys.exit(1)
 
 if __name__ == "__main__":
