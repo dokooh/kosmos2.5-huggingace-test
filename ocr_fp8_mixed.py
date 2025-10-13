@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 def debug_checkpoint(message, checkpoint_id=None):
     """Debug checkpoint function to track execution flow"""
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     if checkpoint_id:
         logger.debug(f"🔍 CHECKPOINT [{checkpoint_id}]: {message}")
         print(f"[{timestamp}] 🔍 CHECKPOINT [{checkpoint_id}]: {message}", flush=True)
@@ -116,6 +116,102 @@ def tensor_to_float(tensor_val):
     if isinstance(tensor_val, torch.Tensor):
         return float(tensor_val.item())
     return float(tensor_val)
+
+def get_model_dtype(model):
+    """Get the primary dtype of the model"""
+    try:
+        for param in model.parameters():
+            if param.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+                return param.dtype
+        return torch.float16  # Default fallback
+    except Exception:
+        return torch.float16
+
+def ensure_dtype_consistency(inputs, target_dtype=None, model=None):
+    """Ensure all input tensors have consistent dtypes to avoid bias/query mismatches"""
+    if target_dtype is None and model is not None:
+        target_dtype = get_model_dtype(model)
+    elif target_dtype is None:
+        target_dtype = torch.float16
+    
+    debug_checkpoint(f"Ensuring dtype consistency with target: {target_dtype}")
+    
+    if isinstance(inputs, dict):
+        consistent_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                # Only convert floating point tensors, preserve integer/bool tensors
+                if value.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.float64]:
+                    if value.dtype != target_dtype:
+                        debug_checkpoint(f"Converting {key} from {value.dtype} to {target_dtype}")
+                        consistent_inputs[key] = value.to(dtype=target_dtype)
+                    else:
+                        consistent_inputs[key] = value
+                else:
+                    # Keep integer/bool tensors as-is
+                    consistent_inputs[key] = value
+            else:
+                consistent_inputs[key] = value
+        return consistent_inputs
+    elif isinstance(inputs, torch.Tensor):
+        if inputs.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.float64]:
+            return inputs.to(dtype=target_dtype)
+        else:
+            return inputs
+    else:
+        return inputs
+
+def safe_model_forward_with_dtype_fix(model, inputs, **generation_kwargs):
+    """Safely perform model generation with dtype consistency fixes"""
+    debug_checkpoint("Starting safe model forward with dtype consistency")
+    
+    # Get model's primary dtype
+    model_dtype = get_model_dtype(model)
+    debug_checkpoint(f"Model primary dtype detected: {model_dtype}")
+    
+    # Ensure input dtype consistency
+    consistent_inputs = ensure_dtype_consistency(inputs, model_dtype, model)
+    
+    # Validate all inputs are on the same device
+    device = None
+    for key, value in consistent_inputs.items():
+        if isinstance(value, torch.Tensor):
+            if device is None:
+                device = value.device
+            elif value.device != device:
+                debug_checkpoint(f"Moving {key} from {value.device} to {device}")
+                consistent_inputs[key] = value.to(device)
+    
+    debug_checkpoint(f"All inputs prepared for device: {device}, dtype: {model_dtype}")
+    
+    try:
+        # Generate with consistent inputs
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **consistent_inputs,
+                **generation_kwargs
+            )
+        debug_checkpoint("Model generation completed successfully with dtype fix")
+        return generated_ids
+    except RuntimeError as e:
+        if "dtype" in str(e).lower() or "bias" in str(e).lower():
+            debug_checkpoint(f"Dtype error encountered, attempting fallback: {e}")
+            
+            # Fallback: try with different dtype
+            fallback_dtype = torch.float32 if model_dtype != torch.float32 else torch.float16
+            debug_checkpoint(f"Trying fallback dtype: {fallback_dtype}")
+            
+            fallback_inputs = ensure_dtype_consistency(inputs, fallback_dtype, model)
+            
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **fallback_inputs,
+                    **generation_kwargs
+                )
+            debug_checkpoint("Model generation completed with fallback dtype")
+            return generated_ids
+        else:
+            raise
 
 class EightBitOCRInference:
     def __init__(self, model_checkpoint, device=None, cache_dir=None, use_8bit=True, mixed_precision=True, force_fallback=False):
@@ -654,6 +750,123 @@ class EightBitOCRInference:
         debug_checkpoint("Bounding box drawing completed", "DRAW_END")
         return annotated_image
     
+    def perform_ocr_custom_prompt(self, image_path, custom_prompt, max_tokens=1024, save_image=None, save_text=None):
+        """Perform OCR on image using custom prompt with 8-bit mixed precision"""
+        debug_checkpoint(f"Starting OCR with custom prompt: {custom_prompt[:50]}...", "OCR_CUSTOM_START")
+        
+        if self.model is None:
+            debug_checkpoint("Model not loaded, loading now")
+            safe_execute(self.load_model, "Load model")
+        
+        # Load and process image
+        image = safe_execute(self.load_image, "Load image", image_path)
+        
+        # Use custom prompt
+        prompt = custom_prompt
+        start_time = time.time()
+        debug_checkpoint(f"Starting inference with custom prompt length: {len(prompt)} chars")
+        
+        try:
+            # Process inputs with custom prompt
+            debug_checkpoint("Processing inputs with custom prompt", "PROCESS_INPUTS_START")
+            inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+            debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
+            
+            # Debug input tensor devices before any processing
+            debug_tensor_devices(inputs, "Raw processor inputs")
+            
+            # Extract scaling information - FIXED: Convert tensors to float properly
+            height = inputs.pop("height")
+            width = inputs.pop("width")
+            raw_width, raw_height = image.size
+            
+            # Convert tensor values to float for calculations
+            height_val = tensor_to_float(height)
+            width_val = tensor_to_float(width)
+            
+            scale_height = raw_height / height_val
+            scale_width = raw_width / width_val
+            
+            debug_checkpoint(f"Image scaling - Raw: {raw_width}x{raw_height}, Processed: {width_val}x{height_val}")
+            debug_checkpoint(f"Scale factors - Height: {scale_height:.3f}, Width: {scale_width:.3f}")
+            debug_checkpoint("Custom prompt input processing completed", "PROCESS_INPUTS_END")
+            
+            # FINAL DEVICE PLACEMENT FIX
+            debug_checkpoint("Moving inputs to device", "DEVICE_MOVE_START")
+            debug_memory_status()
+            
+            # Move inputs to device and ensure correct dtypes
+            inputs = move_inputs_to_device(inputs, self.device, self.dtype)
+            
+            debug_checkpoint(f"Inputs moved to device: {self.device}")
+            debug_tensor_devices(inputs, "After device placement")
+            debug_checkpoint("Device move completed", "DEVICE_MOVE_END")
+            
+            # Generate with enhanced monitoring
+            debug_checkpoint("Starting generation", "GENERATE_START")
+            debug_memory_status()
+            
+            # Use safe generation with dtype consistency
+            generation_kwargs = {
+                'max_new_tokens': max_tokens,
+                'do_sample': False,
+                'pad_token_id': self.processor.tokenizer.eos_token_id,
+                'temperature': 1.0,
+                'top_p': 1.0
+            }
+            
+            with torch.no_grad():
+                with self.get_autocast_context():
+                    try:
+                        generated_ids = safe_model_forward_with_dtype_fix(
+                            self.model, inputs, **generation_kwargs
+                        )
+                    except Exception as e:
+                        debug_checkpoint(f"Safe generation failed, using fallback: {e}")
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            **generation_kwargs
+                        )
+            
+            debug_checkpoint("Generation completed successfully", "GENERATE_END")
+            debug_memory_status()
+            
+            # Process output
+            inference_time = time.time() - start_time
+            debug_checkpoint(f"Generation completed in {inference_time:.2f}s")
+            
+            # Extract and clean generated text
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            debug_checkpoint(f"Generated text length: {len(generated_text)}")
+            
+            # Post-process to extract OCR results
+            ocr_results = self.post_process_ocr(generated_text, scale_height, scale_width, prompt)
+            ocr_results['inference_time'] = inference_time
+            ocr_results['quantization_info'] = self.get_quantization_info()
+            
+            # Save results if requested
+            if save_image and ocr_results.get('bounding_boxes'):
+                annotated_image = self.draw_bounding_boxes(image, ocr_results, save_image)
+            
+            if save_text and ocr_results.get('extracted_text'):
+                self.save_text_results(ocr_results, save_text)
+            
+            debug_checkpoint("OCR with custom prompt completed successfully", "OCR_CUSTOM_END")
+            return ocr_results
+            
+        except Exception as e:
+            debug_checkpoint(f"Error in custom OCR: {str(e)}", "OCR_CUSTOM_ERROR")
+            logger.error(f"Error in perform_ocr_custom_prompt: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'extracted_text': '',
+                'bounding_boxes': [],
+                'text_regions': 0,
+                'inference_time': time.time() - start_time,
+                'quantization_info': self.get_quantization_info() if hasattr(self, 'get_quantization_info') else 'unknown'
+            }
+
     def perform_ocr(self, image_path, max_tokens=1024, save_image=None, save_text=None):
         """Perform OCR on image using 8-bit mixed precision"""
         debug_checkpoint("Starting OCR performance", "OCR_START")
@@ -740,23 +953,36 @@ class EightBitOCRInference:
                 
                 debug_checkpoint(f"Generation kwargs: {generation_kwargs}")
                 
-                # Use mixed precision if enabled and not using 8-bit quantization
-                if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
-                    debug_checkpoint("Using mixed precision autocast")
-                    with torch.cuda.amp.autocast(dtype=self.dtype):
-                        debug_checkpoint("Inside autocast context, calling model.generate")
+                # Use safe generation with comprehensive dtype handling
+                debug_checkpoint("Using safe model generation with dtype consistency")
+                try:
+                    # Use mixed precision if enabled and not using 8-bit quantization
+                    if self.mixed_precision and not self.use_8bit and self.device.startswith('cuda'):
+                        debug_checkpoint("Using mixed precision autocast with dtype fix")
+                        with torch.cuda.amp.autocast(dtype=self.dtype):
+                            generated_ids = safe_model_forward_with_dtype_fix(
+                                self.model, inputs, **generation_kwargs
+                            )
+                    else:
+                        debug_checkpoint("Using standard generation with dtype fix")
+                        generated_ids = safe_model_forward_with_dtype_fix(
+                            self.model, inputs, **generation_kwargs
+                        )
+                    debug_checkpoint("Safe model generation completed successfully")
+                except Exception as generation_error:
+                    debug_checkpoint(f"Primary generation failed: {generation_error}")
+                    
+                    # Fallback: Try with basic generation without dtype modifications
+                    debug_checkpoint("Attempting fallback generation without dtype modifications")
+                    try:
                         generated_ids = self.model.generate(
                             **inputs,
                             **generation_kwargs
                         )
-                        debug_checkpoint("model.generate completed with autocast")
-                else:
-                    debug_checkpoint("Using standard generation (no autocast)")
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        **generation_kwargs
-                    )
-                    debug_checkpoint("model.generate completed without autocast")
+                        debug_checkpoint("Fallback generation succeeded")
+                    except Exception as fallback_error:
+                        debug_checkpoint(f"Fallback generation also failed: {fallback_error}")
+                        raise generation_error  # Raise the original error
             
             debug_checkpoint("Generation completed", "GENERATION_END")
             debug_memory_status()

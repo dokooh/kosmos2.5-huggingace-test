@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 def debug_checkpoint(message, checkpoint_id=None):
     """Debug checkpoint function to track execution flow"""
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     if checkpoint_id:
         logger.debug(f"🔍 CHECKPOINT [{checkpoint_id}]: {message}")
         print(f"[{timestamp}] 🔍 CHECKPOINT [{checkpoint_id}]: {message}", flush=True)
@@ -373,6 +373,92 @@ def enable_cuda_debugging():
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     os.environ['TORCH_USE_CUDA_DSA'] = '1'
     debug_checkpoint("Enabled CUDA debugging environment variables")
+
+def ensure_dtype_consistency_md(inputs, target_dtype=None, model=None):
+    """Ensure all input tensors have consistent dtypes to avoid bias/query mismatches for MD"""
+    if target_dtype is None and model is not None:
+        target_dtype = get_model_dtype(model)
+    elif target_dtype is None:
+        target_dtype = torch.float16
+    
+    debug_checkpoint(f"MD: Ensuring dtype consistency with target: {target_dtype}")
+    
+    if isinstance(inputs, dict):
+        consistent_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                # Only convert floating point tensors, preserve integer/bool tensors
+                if value.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.float64]:
+                    if value.dtype != target_dtype:
+                        debug_checkpoint(f"MD: Converting {key} from {value.dtype} to {target_dtype}")
+                        consistent_inputs[key] = value.to(dtype=target_dtype)
+                    else:
+                        consistent_inputs[key] = value
+                else:
+                    # Keep integer/bool tensors as-is
+                    consistent_inputs[key] = value
+            else:
+                consistent_inputs[key] = value
+        return consistent_inputs
+    elif isinstance(inputs, torch.Tensor):
+        if inputs.dtype in [torch.float32, torch.float16, torch.bfloat16, torch.float64]:
+            return inputs.to(dtype=target_dtype)
+        else:
+            return inputs
+    else:
+        return inputs
+
+def safe_model_forward_with_dtype_fix_md(model, inputs, **generation_kwargs):
+    """Safely perform model generation with dtype consistency fixes for MD"""
+    debug_checkpoint("MD: Starting safe model forward with dtype consistency")
+    
+    # Get model's primary dtype
+    model_dtype = get_model_dtype(model)
+    debug_checkpoint(f"MD: Model primary dtype detected: {model_dtype}")
+    
+    # Ensure input dtype consistency
+    consistent_inputs = ensure_dtype_consistency_md(inputs, model_dtype, model)
+    
+    # Validate all inputs are on the same device
+    device = None
+    for key, value in consistent_inputs.items():
+        if isinstance(value, torch.Tensor):
+            if device is None:
+                device = value.device
+            elif value.device != device:
+                debug_checkpoint(f"MD: Moving {key} from {value.device} to {device}")
+                consistent_inputs[key] = value.to(device)
+    
+    debug_checkpoint(f"MD: All inputs prepared for device: {device}, dtype: {model_dtype}")
+    
+    try:
+        # Generate with consistent inputs
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **consistent_inputs,
+                **generation_kwargs
+            )
+        debug_checkpoint("MD: Model generation completed successfully with dtype fix")
+        return generated_ids
+    except RuntimeError as e:
+        if "dtype" in str(e).lower() or "bias" in str(e).lower():
+            debug_checkpoint(f"MD: Dtype error encountered, attempting fallback: {e}")
+            
+            # Fallback: try with different dtype
+            fallback_dtype = torch.float32 if model_dtype != torch.float32 else torch.float16
+            debug_checkpoint(f"MD: Trying fallback dtype: {fallback_dtype}")
+            
+            fallback_inputs = ensure_dtype_consistency_md(inputs, fallback_dtype, model)
+            
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **fallback_inputs,
+                    **generation_kwargs
+                )
+            debug_checkpoint("MD: Model generation completed with fallback dtype")
+            return generated_ids
+        else:
+            raise
 
 class EightBitMarkdownInference:
     def __init__(self, model_checkpoint, device=None, cache_dir=None, use_8bit=True, mixed_precision=True, force_fallback=False):
@@ -765,6 +851,192 @@ class EightBitMarkdownInference:
         debug_checkpoint(f"Advanced markdown cleaning completed: '{text[:100]}...'")
         return text
     
+    def generate_markdown_custom_prompt(self, image_path, custom_prompt, max_tokens=2048, temperature=0.1, save_output=None):
+        """Generate markdown from image using custom prompt with dtype consistency"""
+        debug_checkpoint(f"Starting markdown generation with custom prompt: {custom_prompt[:50]}...", "MD_CUSTOM_START")
+        
+        if self.model is None:
+            debug_checkpoint("Model not loaded, loading now")
+            safe_execute(self.load_model, "Load model")
+        
+        # Load and process image
+        image = safe_execute(self.load_image, "Load image", image_path)
+        
+        # Use custom prompt
+        prompt = custom_prompt
+        start_time = time.time()
+        debug_checkpoint(f"Starting inference with custom prompt length: {len(prompt)} chars")
+        
+        try:
+            # Process inputs with ultra-safe handling
+            debug_checkpoint("Processing inputs with custom prompt", "PROCESS_INPUTS_START")
+            
+            # Clear CUDA cache before processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+            debug_checkpoint(f"Processor returned keys: {list(inputs.keys())}")
+            
+            # Remove height/width info gracefully
+            height = inputs.pop("height", None)
+            width = inputs.pop("width", None)
+            if height is not None:
+                debug_checkpoint(f"Removed height: {tensor_to_float(height)}")
+            if width is not None:
+                debug_checkpoint(f"Removed width: {tensor_to_float(width)}")
+            
+            debug_checkpoint("Custom prompt input processing completed", "PROCESS_INPUTS_END")
+            
+            # DTYPE-CONSISTENT TENSOR VALIDATION AND DEVICE PLACEMENT
+            debug_checkpoint("Starting dtype-consistent tensor validation", "DTYPE_CONSISTENT_START")
+            debug_memory_status()
+            
+            # Step 1: Get model dtype for consistency
+            model_dtype = self.model_dtype or get_model_dtype(self.model)
+            debug_checkpoint(f"Using model dtype: {model_dtype} for consistency")
+            
+            # Step 2: Ultra-safe tensor validation with target dtype
+            validated_inputs = ultra_safe_tensor_validation_with_dtype(inputs, model_dtype)
+            debug_checkpoint("Tensor validation with dtype completed")
+            
+            # Step 3: Device placement with dtype preservation
+            device_inputs = move_inputs_to_device_preserve_dtype(validated_inputs, self.device)
+            debug_checkpoint(f"Inputs moved to device {self.device} with dtype preservation")
+            
+            debug_checkpoint("Dtype-consistent processing completed", "DTYPE_CONSISTENT_END")
+            
+            # ADVANCED GENERATION WITH DTYPE MONITORING
+            debug_checkpoint("Starting advanced generation with monitoring", "ADVANCED_GENERATE_START")
+            debug_memory_status()
+            
+            # Pre-generation memory and dtype validation
+            debug_checkpoint("Pre-generation validation")
+            for key, tensor in device_inputs.items():
+                debug_checkpoint(f"Input {key}: device={tensor.device}, dtype={tensor.dtype}, shape={tensor.shape}")
+            
+            # Multi-attempt generation with fallback
+            generation_attempts = [
+                {"temperature": temperature, "do_sample": temperature > 0},
+                {"temperature": 0.0, "do_sample": False},  # Fallback to deterministic
+            ]
+            
+            generated_text = None
+            inference_time = None
+            
+            for attempt_idx, gen_params in enumerate(generation_attempts):
+                debug_checkpoint(f"Generation attempt {attempt_idx + 1} with params: {gen_params}")
+                
+                try:
+                    with torch.no_grad():
+                        with self.get_autocast_context():
+                            # Pre-validate inputs one more time
+                            debug_checkpoint("Final input validation before generation")
+                            
+                            generation_start = time.time()
+                            
+                            # Use safe generation with dtype consistency
+                            generation_kwargs = {
+                                "max_new_tokens": max_tokens,
+                                "do_sample": gen_params["do_sample"],
+                                "temperature": gen_params["temperature"] if gen_params["do_sample"] else 1.0,
+                                "top_p": 0.95 if gen_params["do_sample"] else 1.0,
+                                "pad_token_id": self.processor.tokenizer.eos_token_id,
+                                "repetition_penalty": 1.1
+                            }
+                            
+                            try:
+                                generated_ids = safe_model_forward_with_dtype_fix_md(
+                                    self.model, device_inputs, **generation_kwargs
+                                )
+                            except Exception as dtype_error:
+                                debug_checkpoint(f"Safe generation failed, using fallback: {dtype_error}")
+                                generated_ids = self.model.generate(
+                                    **device_inputs,
+                                    **generation_kwargs
+                                )
+                            
+                            inference_time = time.time() - generation_start
+                    
+                    debug_checkpoint(f"Generation attempt {attempt_idx + 1} successful in {inference_time:.2f}s")
+                    
+                    # Extract generated text
+                    generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    debug_checkpoint(f"Generated text length: {len(generated_text)} characters")
+                    break
+                    
+                except Exception as attempt_error:
+                    debug_checkpoint(f"Generation attempt {attempt_idx + 1} failed: {attempt_error}")
+                    if attempt_idx == len(generation_attempts) - 1:
+                        raise attempt_error
+                    continue
+            
+            if generated_text is None:
+                raise RuntimeError("All generation attempts failed")
+            
+            debug_checkpoint("Advanced generation completed", "ADVANCED_GENERATE_END")
+            
+            # ADVANCED MARKDOWN POST-PROCESSING
+            debug_checkpoint("Starting advanced markdown post-processing", "ADVANCED_POST_START")
+            
+            # Clean and enhance markdown
+            markdown_text = self.advanced_clean_markdown(generated_text)
+            debug_checkpoint(f"Cleaned markdown length: {len(markdown_text)} characters")
+            
+            # Enhanced result structure
+            result = {
+                'success': True,
+                'generated_markdown': markdown_text,
+                'raw_generated_text': generated_text,
+                'inference_time': inference_time,
+                'total_processing_time': time.time() - start_time,
+                'model_info': {
+                    'quantization_method': self.quantization_method,
+                    'model_dtype': str(model_dtype),
+                    'device': str(self.device)
+                },
+                'generation_params': {
+                    'max_tokens': max_tokens,
+                    'temperature': temperature,
+                    'custom_prompt_length': len(prompt)
+                },
+                'content_analysis': {
+                    'word_count': len(markdown_text.split()),
+                    'char_count': len(markdown_text),
+                    'line_count': markdown_text.count('\n'),
+                    'headers_count': markdown_text.count('#'),
+                    'lists_count': markdown_text.count('- ') + markdown_text.count('* '),
+                    'tables_count': markdown_text.count('|'),
+                    'code_blocks_count': markdown_text.count('```')
+                }
+            }
+            
+            # Save output if requested
+            if save_output:
+                debug_checkpoint(f"Saving markdown output to: {save_output}")
+                output_dir = os.path.dirname(save_output)
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                
+                with open(save_output, 'w', encoding='utf-8') as f:
+                    f.write(markdown_text)
+                result['output_file'] = save_output
+            
+            debug_checkpoint("Custom markdown generation completed successfully", "MD_CUSTOM_END")
+            return result
+            
+        except Exception as e:
+            debug_checkpoint(f"Error in custom markdown generation: {str(e)}", "MD_CUSTOM_ERROR")
+            logger.error(f"Error in generate_markdown_custom_prompt: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'generated_markdown': '',
+                'inference_time': time.time() - start_time,
+                'quantization_info': getattr(self, 'quantization_method', 'unknown')
+            }
+
     def generate_markdown(self, image_path, max_tokens=1024, temperature=0.0, save_output=None):
         """Generate markdown from image with dtype consistency to fix float/half mismatch"""
         debug_checkpoint("Starting markdown generation with dtype consistency", "MD_START")
@@ -877,10 +1149,17 @@ class EightBitMarkdownInference:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     
-                    generated_ids = self.model.generate(
-                        **final_inputs,
-                        **generation_kwargs
-                    )
+                    # Use safe generation with dtype consistency  
+                    try:
+                        generated_ids = safe_model_forward_with_dtype_fix_md(
+                            self.model, final_inputs, **generation_kwargs
+                        )
+                    except Exception as dtype_error:
+                        debug_checkpoint(f"Safe generation failed in standard mode, using fallback: {dtype_error}")
+                        generated_ids = self.model.generate(
+                            **final_inputs,
+                            **generation_kwargs
+                        )
                     debug_checkpoint("model.generate completed successfully")
                     
                     # Synchronize after generation
