@@ -796,7 +796,7 @@ class EightBitOCRInference:
             debug_memory_status()
             
             # Move inputs to device and ensure correct dtypes
-            inputs = move_inputs_to_device(inputs, self.device, self.dtype)
+            inputs = move_to_device_safe(inputs, self.device, self.dtype)
             
             debug_checkpoint(f"Inputs moved to device: {self.device}")
             debug_tensor_devices(inputs, "After device placement")

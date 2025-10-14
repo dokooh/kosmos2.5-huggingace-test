@@ -902,7 +902,7 @@ class EightBitMarkdownInference:
             debug_checkpoint("Tensor validation with dtype completed")
             
             # Step 3: Device placement with dtype preservation
-            device_inputs = move_inputs_to_device_preserve_dtype(validated_inputs, self.device)
+            device_inputs = ultra_safe_device_move_with_dtype(validated_inputs, self.device, model_dtype)
             debug_checkpoint(f"Inputs moved to device {self.device} with dtype preservation")
             
             debug_checkpoint("Dtype-consistent processing completed", "DTYPE_CONSISTENT_END")
