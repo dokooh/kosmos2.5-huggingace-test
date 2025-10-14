@@ -708,6 +708,20 @@ class EightBitMarkdownInference:
         
         debug_checkpoint("Post-loading setup completed", "POSTLOAD_END")
     
+    def get_autocast_context(self):
+        """Get appropriate autocast context based on configuration"""
+        debug_checkpoint("Getting autocast context")
+        
+        if self.mixed_precision and torch.cuda.is_available() and self.device.startswith('cuda'):
+            # Use mixed precision autocast for CUDA
+            debug_checkpoint("Using CUDA mixed precision autocast")
+            return torch.cuda.amp.autocast(dtype=self.dtype)
+        else:
+            # Use null context (no autocast) for CPU or when mixed precision disabled
+            debug_checkpoint("Using null context (no autocast)")
+            from contextlib import nullcontext
+            return nullcontext()
+    
     def load_image(self, image_path):
         """Load image from local path or URL with error handling"""
         debug_checkpoint(f"Loading image: {image_path}", "IMAGE_LOAD_START")
