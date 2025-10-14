@@ -12,8 +12,9 @@ Modules:
 - batch_processor_fp8_mixed: Batch processing utilities
 """
 
-from .ocr_fp8_mixed import EightBitOCRInference
-from .md_fp8_mixed import EightBitMarkdownInference
+from ocr_fp8_mixed import EightBitOCRInference
+from md_fp8_mixed import EightBitMarkdownInference
 
 __all__ = ['EightBitOCRInference', 'EightBitMarkdownInference']
+
 __version__ = '1.0.0'
