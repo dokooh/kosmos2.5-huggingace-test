@@ -19,8 +19,9 @@ import time
 import json
 import logging
 import threading
+import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from PIL import Image
 
 # Import the 8-bit mixed precision inference modules
@@ -466,79 +467,293 @@ Generate polished, business-ready markdown documentation."""
         
         print(f"\\n💾 Results saved to: {output_path}")
         return str(output_path)
+    
+    def process_batch(self, input_path: str, output_dir: str, 
+                     ocr_prompt_key: str = 'ocr_structured',
+                     md_prompt_key: str = 'markdown_comprehensive',
+                     ocr_max_tokens: int = 2048,
+                     md_max_tokens: int = 2048,
+                     temperature: float = 0.1,
+                     image_extensions: List[str] = None) -> Dict[str, Any]:
+        """Process a single image or batch of images with comprehensive reporting"""
+        
+        if image_extensions is None:
+            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp']
+        
+        # Determine if input is file or directory
+        input_path_obj = Path(input_path)
+        
+        if input_path_obj.is_file():
+            # Single image processing
+            if input_path_obj.suffix.lower() in image_extensions:
+                images_to_process = [str(input_path_obj)]
+            else:
+                raise ValueError(f"File {input_path} is not a supported image format")
+        elif input_path_obj.is_dir():
+            # Directory processing - find all images
+            images_to_process = []
+            for ext in image_extensions:
+                for case_ext in [ext.lower(), ext.upper()]:
+                    pattern = f"*{case_ext}"
+                    found_files = list(input_path_obj.glob(pattern))
+                    images_to_process.extend([str(f) for f in found_files])
+            
+            # Remove duplicates and sort
+            images_to_process = list(set(images_to_process))
+            images_to_process.sort()
+            
+            if not images_to_process:
+                raise ValueError(f"No supported images found in directory {input_path}")
+        else:
+            raise ValueError(f"Input path {input_path} does not exist")
+        
+        logger.info(f"🔍 Found {len(images_to_process)} image(s) to process")
+        print(f"📊 Processing {len(images_to_process)} image(s)")
+        
+        # Initialize batch results
+        batch_results = {
+            'total_images': len(images_to_process),
+            'successful_images': 0,
+            'failed_images': 0,
+            'individual_results': [],
+            'batch_start_time': time.time(),
+            'configuration': {
+                'ocr_prompt_key': ocr_prompt_key,
+                'md_prompt_key': md_prompt_key,
+                'ocr_max_tokens': ocr_max_tokens,
+                'md_max_tokens': md_max_tokens,
+                'temperature': temperature,
+                'model_checkpoint': self.model_checkpoint,
+                'use_8bit': self.use_8bit,
+                'mixed_precision': self.mixed_precision
+            }
+        }
+        
+        # Process each image
+        for i, image_path in enumerate(images_to_process, 1):
+            print(f"\\n{'=' * 60}")
+            print(f"📷 Processing image {i}/{len(images_to_process)}: {Path(image_path).name}")
+            print(f"{'=' * 60}")
+            
+            try:
+                result = self.process_image_dual_mode(
+                    image_path=image_path,
+                    ocr_prompt_key=ocr_prompt_key,
+                    md_prompt_key=md_prompt_key,
+                    ocr_max_tokens=ocr_max_tokens,
+                    md_max_tokens=md_max_tokens,
+                    temperature=temperature,
+                    output_dir=output_dir
+                )
+                
+                batch_results['individual_results'].append(result)
+                
+                if result['both_successful']:
+                    batch_results['successful_images'] += 1
+                    logger.info(f"✅ Successfully processed {Path(image_path).name}")
+                else:
+                    batch_results['failed_images'] += 1
+                    logger.warning(f"❌ Failed to process {Path(image_path).name}")
+                    
+            except Exception as e:
+                batch_results['failed_images'] += 1
+                error_result = {
+                    'image_path': image_path,
+                    'image_name': Path(image_path).name,
+                    'success': False,
+                    'error': str(e),
+                    'both_successful': False
+                }
+                batch_results['individual_results'].append(error_result)
+                logger.error(f"💥 Error processing {Path(image_path).name}: {e}")
+        
+        # Calculate batch statistics
+        batch_results['batch_end_time'] = time.time()
+        batch_results['total_batch_time'] = batch_results['batch_end_time'] - batch_results['batch_start_time']
+        batch_results['success_rate'] = (batch_results['successful_images'] / batch_results['total_images']) * 100
+        batch_results['average_time_per_image'] = batch_results['total_batch_time'] / batch_results['total_images']
+        
+        # Save batch report
+        batch_report_file = Path(output_dir) / "batch_processing_report.json"
+        try:
+            with open(batch_report_file, 'w', encoding='utf-8') as f:
+                json.dump(batch_results, f, indent=2, ensure_ascii=False, default=str)
+            logger.info(f"📄 Batch report saved to: {batch_report_file}")
+        except Exception as e:
+            logger.error(f"Failed to save batch report: {e}")
+        
+        # Print batch summary
+        self._print_batch_summary(batch_results)
+        
+        return batch_results
+    
+    def _print_batch_summary(self, batch_results: Dict[str, Any]):
+        """Print comprehensive batch processing summary"""
+        print(f"\\n{'=' * 80}")
+        print("📊 BATCH PROCESSING SUMMARY")
+        print(f"{'=' * 80}")
+        
+        print(f"\\n📈 STATISTICS:")
+        print(f"  Total Images: {batch_results['total_images']}")
+        print(f"  Successful: {batch_results['successful_images']} ✅")
+        print(f"  Failed: {batch_results['failed_images']} ❌")
+        print(f"  Success Rate: {batch_results['success_rate']:.1f}%")
+        
+        print(f"\\n⏱️  TIMING:")
+        print(f"  Total Time: {batch_results['total_batch_time']:.2f}s")
+        print(f"  Average per Image: {batch_results['average_time_per_image']:.2f}s")
+        print(f"  Images per Minute: {(batch_results['total_images'] / batch_results['total_batch_time']) * 60:.1f}")
+        
+        config = batch_results['configuration']
+        print(f"\\n⚙️  CONFIGURATION:")
+        print(f"  OCR Prompt: {config['ocr_prompt_key']}")
+        print(f"  Markdown Prompt: {config['md_prompt_key']}")
+        print(f"  OCR Tokens: {config['ocr_max_tokens']}")
+        print(f"  MD Tokens: {config['md_max_tokens']}")
+        print(f"  Temperature: {config['temperature']}")
+        print(f"  8-bit Quantization: {'Enabled' if config['use_8bit'] else 'Disabled'}")
+        print(f"  Mixed Precision: {'Enabled' if config['mixed_precision'] else 'Disabled'}")
+        
+        print(f"\\n{'=' * 80}")
+        
+        if batch_results['failed_images'] > 0:
+            print("⚠️  Some images failed to process. Check individual results for details.")
+        else:
+            print("🎉 All images processed successfully!")
 
+
+def get_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Enhanced Custom Batch Processor for Kosmos-2.5 with dedicated prompts',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Input/Output arguments (required)
+    parser.add_argument('--input', '-i', type=str, required=True,
+                       help='Path to input image file or folder containing images')
+    parser.add_argument('--output', '-o', type=str, required=True,
+                       help='Path to output folder for results')
+    
+    # Model configuration
+    parser.add_argument('--model_checkpoint', '-m', type=str, 
+                       default="fp8/models/kosmos-fp8-mixed",
+                       help='Path to model checkpoint')
+    parser.add_argument('--device', '-d', type=str, default=None,
+                       help='Device to use (auto-detected if not specified)')
+    
+    # Processing configuration
+    parser.add_argument('--no_8bit', action='store_true',
+                       help='Disable 8-bit quantization')
+    parser.add_argument('--no_mixed_precision', action='store_true',
+                       help='Disable mixed precision')
+    
+    # Prompt selection
+    parser.add_argument('--ocr_prompt', type=str, default='ocr_structured',
+                       choices=['ocr_detailed', 'ocr_structured'],
+                       help='OCR prompt to use')
+    parser.add_argument('--md_prompt', type=str, default='markdown_comprehensive',
+                       choices=['markdown_comprehensive', 'markdown_technical', 'markdown_business'],
+                       help='Markdown prompt to use')
+    
+    # Token limits and generation parameters
+    parser.add_argument('--ocr_tokens', type=int, default=2048,
+                       help='Maximum tokens for OCR generation')
+    parser.add_argument('--md_tokens', type=int, default=2048,
+                       help='Maximum tokens for Markdown generation')
+    parser.add_argument('--temperature', '-t', type=float, default=0.1,
+                       help='Temperature for Markdown generation (0.0-1.0)')
+    
+    # File handling
+    parser.add_argument('--image_extensions', type=str, nargs='+',
+                       default=['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'],
+                       help='Image file extensions to process')
+    
+    # Display options
+    parser.add_argument('--show_prompts', action='store_true',
+                       help='Display all custom prompts for validation')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug output')
+    
+    return parser.parse_args()
 
 def main():
-    """Main execution function"""
-    print("🚀 Custom Batch Processor for Kosmos-2.5")
-    print("="*50)
+    """Main execution function with command line argument support"""
+    args = get_args()
     
-    # Configuration
-    model_checkpoint = "fp8/models/kosmos-fp8-mixed"  # Adjust path as needed
-    image_path = "eds_pages/Final-Tech901-5-16383 (1)_pages/page_042.png"  # Using available page
-    output_dir = "./custom_processing_results"
+    # Set logging level
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        print("🔍 Debug mode enabled")
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+        print("📝 Verbose mode enabled")
     
-    # Check if image exists
-    if not os.path.exists(image_path):
-        print(f"❌ Image not found: {image_path}")
-        print("Available images:")
-        parent_dir = Path(image_path).parent
-        if parent_dir.exists():
-            for img in sorted(parent_dir.glob("page_*.png"))[:5]:
-                print(f"   📄 {img.name}")
-        return
+    # Validate arguments
+    if args.temperature < 0 or args.temperature > 1.0:
+        print(f"❌ Error: Temperature must be between 0.0 and 1.0, got {args.temperature}")
+        sys.exit(1)
     
-    # Initialize processor
+    print("🚀 Enhanced Custom Batch Processor for Kosmos-2.5")
+    print("="*60)
+    print(f"📥 Input: {args.input}")
+    print(f"📤 Output: {args.output}")
+    print(f"🤖 Model: {args.model_checkpoint}")
+    print(f"🔍 OCR Prompt: {args.ocr_prompt}")
+    print(f"📝 Markdown Prompt: {args.md_prompt}")
+    print(f"⚡ 8-bit Quantization: {'Disabled' if args.no_8bit else 'Enabled'}")
+    print(f"🔥 Mixed Precision: {'Disabled' if args.no_mixed_precision else 'Enabled'}")
+    print(f"🌡️  Temperature: {args.temperature}")
+    print("="*60)
+    
     try:
+        # Initialize processor
         processor = CustomBatchProcessor(
-            model_checkpoint=model_checkpoint,
-            device=None,  # Auto-detect
-            use_8bit=True,
-            mixed_precision=True
+            model_checkpoint=args.model_checkpoint,
+            device=args.device,
+            use_8bit=not args.no_8bit,
+            mixed_precision=not args.no_mixed_precision
         )
         
-        # Display prompts for validation
-        processor.display_prompts()
+        # Display custom prompts if requested
+        if args.show_prompts:
+            processor.display_prompts()
         
-        # Process image with dual mode
-        print(f"\\n🎯 Processing image: {Path(image_path).name}")
-        results = processor.process_image_dual_mode(
-            image_path=image_path,
-            ocr_prompt_key='ocr_structured',
-            md_prompt_key='markdown_comprehensive',
-            ocr_max_tokens=1024,
-            md_max_tokens=2048,
-            temperature=0.1
+        # Validate input path
+        if not os.path.exists(args.input):
+            print(f"❌ Error: Input path not found: {args.input}")
+            sys.exit(1)
+        
+        # Process images
+        batch_results = processor.process_batch(
+            input_path=args.input,
+            output_dir=args.output,
+            ocr_prompt_key=args.ocr_prompt,
+            md_prompt_key=args.md_prompt,
+            ocr_max_tokens=args.ocr_tokens,
+            md_max_tokens=args.md_tokens,
+            temperature=args.temperature,
+            image_extensions=args.image_extensions
         )
         
-        # Save results
-        output_path = processor.save_results(results, output_dir)
+        # Exit with appropriate code
+        if batch_results['failed_images'] == 0:
+            print("\\n🎉 All images processed successfully!")
+            sys.exit(0)
+        else:
+            print(f"\\n⚠️  {batch_results['failed_images']} image(s) failed to process")
+            sys.exit(1)
         
-        # Final summary
-        print(f"\\n" + "="*80)
-        print("🎊 PROCESSING COMPLETE")
-        print("="*80)
-        print(f"📁 Output saved to: {output_path}")
-        print(f"⏱️  Total processing time: {results['total_processing_time']:.2f}s")
-        print(f"✅ Both tasks successful: {results['both_successful']}")
-        
-        if results['ocr_result'].get('success'):
-            ocr_stats = results['ocr_result']
-            print(f"\\n📊 OCR Results:")
-            print(f"   Text regions: {ocr_stats.get('text_regions', 0)}")
-            print(f"   Processing time: {ocr_stats.get('processing_time', 0):.2f}s")
-        
-        if results['markdown_result'].get('success'):
-            md_stats = results['markdown_result']
-            print(f"\\n📝 Markdown Results:")
-            print(f"   Words generated: {md_stats.get('word_count', 0)}")
-            print(f"   Headers found: {md_stats.get('headers', 0)}")
-            print(f"   Processing time: {md_stats.get('processing_time', 0):.2f}s")
-        
+    except KeyboardInterrupt:
+        print("\\n🛑 Processing interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
+        print(f"❌ Fatal error: {e}")
+        logger.error(f"Fatal error in main: {e}")
         traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
